@@ -2,7 +2,7 @@
 //!
 //! The listener's file name IS the host identity — no metadata, no
 //! mapping tables. The ssh RemoteForward on each remote points at the
-//! matching ~/.porthole.d/<host>.sock on this machine.
+//! matching `~/.porthole.d/<host>.sock` on this machine.
 
 use std::env;
 use std::fs;
@@ -27,7 +27,7 @@ use crate::tunnel::{self, Ensure, Registry};
 ///
 /// The host list arrives on argv: in production the launchd plist that
 /// home-manager generates carries it, so there is no config file format
-/// to design. The runtime is built by hand instead of via #[tokio::main]
+/// to design. The runtime is built by hand instead of via `#[tokio::main]`
 /// so its construction stays visible: one OS thread, one I/O driver,
 /// every task polled on this thread.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
@@ -344,7 +344,7 @@ pub fn status(_args: impl Iterator<Item = String>) -> ExitCode {
 }
 
 /// Recognize one of our tunnel children in a ps line's tokens:
-/// ssh -N -L <port>:localhost:<port> -o ExitOnForwardFailure=yes <host>
+/// `ssh -N -L <port>:localhost:<port> -o ExitOnForwardFailure=yes <host>`
 fn parse_tunnel<'a>(tokens: &[&'a str]) -> Option<(u16, &'a str)> {
     let (_, args) = tokens.split_first()?;
     let program = args.first()?;
