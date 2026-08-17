@@ -79,9 +79,11 @@
                 ln -s $out/bin/porthole $out/bin/ph
               ''
               + pkgs.lib.optionalString (!daemon) ''
-                # Busybox-style argv[0] dispatch makes this the `open`
-                # shim for macOS-style callers and $BROWSER.
+                # Busybox-style argv[0] dispatch makes these shims:
+                # `open` for macOS-style callers and $BROWSER, `pbcopy`
+                # for the clipboard bridge.
                 ln -s $out/bin/porthole $out/bin/open
+                ln -s $out/bin/porthole $out/bin/pbcopy
               '';
               meta.mainProgram = "porthole";
             };

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::runtime::Builder;
@@ -200,30 +200,34 @@ async fn handle_line(host: &str, line: &str, registry: &Registry) {
             return;
         }
     };
-    match classify(&request.url) {
-        Ok(Target::Direct) => open_and_log(host, &request.url).await,
+    match request {
+        Request::Open { url } => handle_open(host, &url, registry).await,
+        Request::Clipboard { clipboard } => set_clipboard(host, &clipboard).await,
+    }
+}
+
+async fn handle_open(host: &str, url: &str, registry: &Registry) {
+    match classify(url) {
+        Ok(Target::Direct) => open_and_log(host, url).await,
         Ok(Target::Tunnel(port)) => match registry.ensure(host, port).await {
             Ok(Ensure::Ready) | Ok(Ensure::Started) => {
                 if tunnel::wait_ready(port).await {
-                    open_and_log(host, &request.url).await;
+                    open_and_log(host, url).await;
                 } else {
                     eprintln!(
-                        "porthole daemon: {host}: tunnel on port {port} did not become ready, not opening {}",
-                        request.url
+                        "porthole daemon: {host}: tunnel on port {port} did not become ready, not opening {url}"
                     );
                 }
             }
             Ok(Ensure::LocalWins) => {
                 eprintln!(
-                    "porthole daemon: {host}: port {port} already bound locally, opening {} without a tunnel (local wins)",
-                    request.url
+                    "porthole daemon: {host}: port {port} already bound locally, opening {url} without a tunnel (local wins)"
                 );
-                open_and_log(host, &request.url).await;
+                open_and_log(host, url).await;
             }
             Ok(Ensure::Conflict(other)) => {
                 eprintln!(
-                    "porthole daemon: {host}: rejected {}: port {port} is already tunneled to '{other}' (first tunnel wins)",
-                    request.url
+                    "porthole daemon: {host}: rejected {url}: port {port} is already tunneled to '{other}' (first tunnel wins)"
                 );
             }
             Err(e) => {
@@ -231,11 +235,38 @@ async fn handle_line(host: &str, line: &str, registry: &Registry) {
             }
         },
         Err(reason) => {
+            eprintln!("porthole daemon: {host}: rejected {url}: {reason}");
+        }
+    }
+}
+
+/// PORTHOLE_PBCOPY is the same kind of test seam as PORTHOLE_OPENER:
+/// on macOS this is /usr/bin/pbcopy; under test it captures to a file.
+async fn set_clipboard(host: &str, text: &str) {
+    let tool = env::var("PORTHOLE_PBCOPY").unwrap_or_else(|_| "/usr/bin/pbcopy".to_string());
+    let spawned = Command::new(tool).stdin(process::Stdio::piped()).spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("porthole daemon: {host}: clipboard tool failed to spawn: {e}");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(text.as_bytes()).await {
+            eprintln!("porthole daemon: {host}: writing to clipboard tool: {e}");
+        }
+        drop(stdin);
+    }
+    match child.wait().await {
+        Ok(s) if s.success() => {
             eprintln!(
-                "porthole daemon: {host}: rejected {}: {reason}",
-                request.url
+                "porthole daemon: {host}: clipboard set ({} bytes)",
+                text.len()
             );
         }
+        Ok(s) => eprintln!("porthole daemon: {host}: clipboard tool exited with {s}"),
+        Err(e) => eprintln!("porthole daemon: {host}: waiting for clipboard tool: {e}"),
     }
 }
 

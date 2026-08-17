@@ -21,8 +21,15 @@ echo "\$1" >> "$T/opened.log"
 EOF
 chmod +x "$T/opener.sh"
 
+cat > "$T/pbcopy.sh" <<EOF
+#!/bin/sh
+cat > "$T/clipboard.txt"
+EOF
+chmod +x "$T/pbcopy.sh"
+
 export HOME=$T
 export PORTHOLE_OPENER="$T/opener.sh"
+export PORTHOLE_PBCOPY="$T/pbcopy.sh"
 
 echo "== start daemon for host 'testhost' =="
 ./target/debug/porthole daemon testhost 2>"$T/daemon.log" &
@@ -73,5 +80,30 @@ sleep 0.3
 cat "$T/opened.log"
 echo "== daemon2 log (expect the oversized-line rejection) =="
 cat "$T/daemon2.log"
+
+echo "== 7. clipboard, detached (stdout is a pipe → daemon socket) =="
+printf 'hello clipboard' | ./target/debug/porthole clipboard
+sleep 0.3
+echo "--- clipboard capture:" && cat "$T/clipboard.txt"
+
+echo "== 8. clipboard, attached (stdout is a tty → OSC 52, no daemon) =="
+expected=$(printf 'term-test' | base64 -w 0)
+if command -v script >/dev/null; then
+    script -qec "printf 'term-test' | ./target/debug/porthole clipboard" "$T/tty.log" >/dev/null
+    if grep -qF "$(printf '\033]52;c;')${expected}" "$T/tty.log"; then
+        echo "   OSC 52 sequence emitted on the tty"
+    else
+        echo "FAIL: no OSC 52 sequence in tty output"; exit 1
+    fi
+else
+    echo "   (script(1) unavailable, skipping)"
+fi
+
+echo "== 9. clipboard with daemon down: fails fast, never spools =="
+kill -TERM "$DPID"; DPID=""
+sleep 0.7
+rc=0; printf 'never' | ./target/debug/porthole clipboard || rc=$?
+echo "   exit=$rc (expect 1)"
+[ ! -e "$T/.porthole.spool" ] && echo "   no spool written" || { echo "FAIL: clipboard was spooled"; exit 1; }
 
 echo "== smoke test passed =="
