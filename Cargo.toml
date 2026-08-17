@@ -1,0 +1,48 @@
+[package]
+name = "porthole"
+version = "0.0.0"
+edition = "2024"
+description = "Open URLs from remote machines in the local macOS browser"
+license = "MIT"
+repository = "https://github.com/mattrobenolt/porthole"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+# Daemon-side roles only (daemon/status/tunnel — the macOS build). The
+# remote client uses blocking std I/O and never compiles tokio.
+# Single-threaded only: no "rt-multi-thread", the work-stealing scheduler
+# is not compiled in. No "macros": the runtime is built by hand.
+tokio = { version = "1", default-features = false, optional = true, features = [
+    "rt",
+    "net",
+    "process",
+    "signal",
+    "time",
+    "io-util",
+] }
+
+[features]
+default = ["daemon"]
+# macOS-side roles. The remote build uses --no-default-features and
+# ships only the `open` client.
+daemon = ["dep:tokio"]
+
+# Opt-in restriction lint: paths longer than two segments must be imported
+# rather than written inline. Mechanically enforces one path style.
+[dev-dependencies]
+# examples/mio_accept.rs only — the reactor without the runtime.
+# default-features off: mio's default "log" feature would drag in the
+# log crate for nothing.
+mio = { version = "1", default-features = false, features = ["os-poll", "net"] }
+
+[lints.clippy]
+absolute_paths = "warn"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
