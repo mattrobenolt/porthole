@@ -1,5 +1,10 @@
 self:
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 # home-manager module for the macOS local host: runs the daemon under
 # launchd and declares one ssh RemoteForward per managed host, from the
 # same attrset — one edit wires both halves of the contract.

@@ -1,5 +1,10 @@
 self:
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 # home-manager module for a NixOS remote: installs the porthole client
 # and registers it as the machine's "browser" so xdg-open, $BROWSER,
 # gio/mimeapps, and macOS-style `open` calls all route to the mac.
