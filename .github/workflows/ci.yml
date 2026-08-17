@@ -1,0 +1,65 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write # cache save/restore
+      contents: read # checkout
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: nix store cache
+        uses: DeterminateSystems/flakehub-cache-action@e62e272c914d4ad8e4d1587a864e9c3ad2cba9de # v3.21.9
+      - name: cargo registry cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      - name: fmt
+        run: nix develop -c cargo fmt --check
+      - name: clippy (full build)
+        run: nix develop -c cargo clippy
+      - name: clippy (remote client build)
+        run: nix develop -c cargo clippy --no-default-features
+      - name: unit tests
+        run: nix develop -c cargo test
+      - name: smoke rig (client + daemon + junk flood)
+        run: nix develop -c bash scripts/smoke.sh
+      - name: smoke rig (tunnel registry + lifecycle)
+        run: nix develop -c bash scripts/smoke-tunnel.sh
+      - name: smoke rig (real ssh end-to-end)
+        run: nix develop -c bash scripts/smoke-e2e.sh
+      - name: nix build (both roles)
+        run: nix build .#porthole .#porthole-remote
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      actions: write # cache save/restore
+      contents: read # checkout
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: nix store cache
+        uses: DeterminateSystems/flakehub-cache-action@e62e272c914d4ad8e4d1587a864e9c3ad2cba9de # v3.21.9
+      - name: nix build (both roles, darwin)
+        run: nix build .#porthole .#porthole-remote

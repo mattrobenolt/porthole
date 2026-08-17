@@ -103,6 +103,13 @@
               # Test tooling: drive daemon sockets directly (nc -U).
               # Declared here because the system netcat variant is a lottery.
               netcat
+              # smoke-e2e runs a user-mode sshd.
+              openssh
+              # Task runner + GitHub Actions hygiene tooling. CI runs
+              # both of these in the security workflow.
+              just
+              pinact
+              zizmor
             ];
           };
         };

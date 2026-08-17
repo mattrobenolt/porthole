@@ -1,0 +1,45 @@
+name: actions-security
+on:
+  pull_request:
+    paths: [".github/**", "Justfile", "flake.nix"]
+  push:
+    branches: [main]
+    paths: [".github/**", "Justfile", "flake.nix"]
+
+permissions: {}
+
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: zizmor audit
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          advanced-security: false
+          min-confidence: medium
+
+  pinact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write # cache save/restore
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: nix store cache
+        uses: DeterminateSystems/flakehub-cache-action@e62e272c914d4ad8e4d1587a864e9c3ad2cba9de # v3.21.9
+      - name: verify action pinning
+        run: nix develop -c pinact run --check --verify --min-age 3
