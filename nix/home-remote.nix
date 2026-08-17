@@ -37,16 +37,19 @@ in
     # symlink argv[0]-dispatches to `porthole open`.
     home.sessionVariables.BROWSER = "${cfg.package}/bin/open";
 
-    # These gates default off (or vary by hm vintage); without them the
-    # entries below silently render nothing.
-    xdg.enable = lib.mkDefault true;
+    # mimeApps has its own enable gate (off by default).
     xdg.mimeApps.enable = true;
 
-    xdg.desktopEntries.porthole = {
-      name = "porthole";
-      exec = "${cfg.package}/bin/porthole open %u";
-      noDisplay = true;
-    };
+    # Written directly rather than via xdg.desktopEntries: that option is
+    # gated behind the global xdg.enable, which headless configs often
+    # disable, and our handler must render regardless.
+    home.file.".local/share/applications/porthole.desktop".text = ''
+      [Desktop Entry]
+      Type=Application
+      Name=porthole
+      Exec=${cfg.package}/bin/porthole open %u
+      NoDisplay=true
+    '';
 
     xdg.mimeApps.defaultApplications = {
       "x-scheme-handler/http" = "porthole.desktop";
