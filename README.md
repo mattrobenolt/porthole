@@ -57,10 +57,16 @@ services.openssh.settings.StreamLocalBindUnlink = true;
 
 On the remote, nothing changes. Every entry point routes to the client:
 
-- `xdg-open <url>` through the registered MIME handler
-- tools that read `$BROWSER`
+- `xdg-open <url>`, which honors `$BROWSER`
+- tools that read `$BROWSER` directly
+- `gio open <url>` through the registered MIME handler
 - a plain `open <url>` shim for macOS-style callers
 - `porthole open <url>` directly
+
+Note: on a headless remote, xdg-open consults the MIME database only when
+a display is present (`has_display` in xdg-open). The reliable route there
+is `$BROWSER`. home-manager sets it, but only if your shell sources
+home-manager's session variables file.
 
 On the Mac, `porthole status` shows the listening sockets and live tunnels.
 `ph` is a short symlink for the impatient.

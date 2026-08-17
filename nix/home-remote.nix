@@ -42,7 +42,9 @@ in
 
     # Written directly rather than via xdg.desktopEntries: that option is
     # gated behind the global xdg.enable, which headless configs often
-    # disable, and our handler must render regardless.
+    # disable, and our handler must render regardless. This entry serves
+    # gio and other MIME-database consumers; xdg-open's MIME route is
+    # display-gated upstream, so headless xdg-open uses $BROWSER.
     home.file.".local/share/applications/porthole.desktop".text = ''
       [Desktop Entry]
       Type=Application
