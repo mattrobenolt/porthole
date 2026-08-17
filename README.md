@@ -63,6 +63,12 @@ On the remote, nothing changes. Every entry point routes to the client:
 - a plain `open <url>` shim for macOS-style callers
 - `porthole open <url>` directly
 
+The clipboard bridges too: `cat foo.txt | pbcopy` puts stdin on the Mac's
+clipboard. Attached to a terminal this speaks OSC 52 directly and needs
+nothing else running. Detached, it goes through the daemon. Clipboard
+writes are never spooled — a late paste would clobber the current
+clipboard with stale content.
+
 Note: on a headless remote, xdg-open consults the MIME database only when
 a display is present (`has_display` in xdg-open). The reliable route there
 is `$BROWSER`. home-manager sets it, but only if your shell sources
