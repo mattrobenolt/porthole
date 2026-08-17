@@ -82,6 +82,11 @@ sleep 6
 echo "== 6. porthole status (tunnels show none here: the stub ssh execs into nc) =="
 ./target/debug/porthole status
 
+echo "== 6.5 tunnel subcommand (rig covers only the negative paths) =="
+./target/debug/porthole tunnel list
+rc=0; ./target/debug/porthole tunnel kill 3000 || rc=$?; echo "kill-missing exit=$rc"
+rc=0; ./target/debug/porthole tunnel frobnicate || rc=$?; echo "unknown exit=$rc"
+
 echo "== 7. SIGTERM: sockets removed, tunnel children killed =="
 kill -TERM "$DPID"
 DPID=""

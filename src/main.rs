@@ -72,7 +72,7 @@ fn main() -> ExitCode {
         #[cfg(feature = "daemon")]
         "status" => daemon::status(args),
         #[cfg(feature = "daemon")]
-        "tunnel" => tunnel(args),
+        "tunnel" => daemon::tunnel(args),
         "-h" | "--help" | "help" => {
             print!("{HELP}");
             ExitCode::SUCCESS
@@ -184,10 +184,4 @@ fn write_request(w: &mut impl Write, url: &str) -> io::Result<()> {
     })
     .expect("serializing a string field cannot fail");
     writeln!(w, "{line}")
-}
-
-#[cfg(feature = "daemon")]
-fn tunnel(_args: impl Iterator<Item = String>) -> ExitCode {
-    eprintln!("porthole tunnel: not implemented yet");
-    ExitCode::FAILURE
 }

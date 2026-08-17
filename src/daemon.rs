@@ -319,28 +319,105 @@ pub fn status(_args: impl Iterator<Item = String>) -> ExitCode {
     }
 
     println!("tunnels:");
-    let ps = process::Command::new("ps")
-        .args(["-eo", "pid=,args="])
-        .output();
-    match ps {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let mut any = false;
-            for line in stdout.lines() {
-                let tokens: Vec<&str> = line.split_whitespace().collect();
-                if let Some((port, host)) = parse_tunnel(&tokens) {
-                    println!("  port {port} → {host} (pid {})", tokens[0]);
-                    any = true;
-                }
-            }
-            if !any {
-                println!("  (none)");
-            }
-        }
-        Err(e) => eprintln!("porthole status: ps failed: {e}"),
+    let tunnels = find_tunnels();
+    if tunnels.is_empty() {
+        println!("  (none)");
+    }
+    for t in &tunnels {
+        println!("  port {} → {} (pid {})", t.port, t.host, t.pid);
     }
 
     ExitCode::SUCCESS
+}
+
+/// `porthole tunnel [list] | kill <port>`.
+///
+/// No admin channel is needed: the process table is the shared state.
+/// Listing scans for tunnel children; killing signals the ssh child
+/// directly, and the daemon's reaper drops the registry entry when the
+/// child exits. The system converges through process death.
+pub fn tunnel(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut args = args;
+    match args.next().as_deref() {
+        None | Some("list") => {
+            let tunnels = find_tunnels();
+            if tunnels.is_empty() {
+                println!("no tunnels");
+            }
+            for t in &tunnels {
+                println!("port {} → {} (pid {})", t.port, t.host, t.pid);
+            }
+            ExitCode::SUCCESS
+        }
+        Some("kill") => {
+            let Some(port) = args.next().and_then(|p| p.parse::<u16>().ok()) else {
+                eprintln!("usage: porthole tunnel kill <port>");
+                return ExitCode::from(2);
+            };
+            let tunnels = find_tunnels();
+            let Some(t) = tunnels.iter().find(|t| t.port == port) else {
+                eprintln!("porthole tunnel: no tunnel on port {port}");
+                return ExitCode::FAILURE;
+            };
+            let status = process::Command::new("kill")
+                .arg(t.pid.to_string())
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    println!(
+                        "killed tunnel on port {port} (pid {}, was → {})",
+                        t.pid, t.host
+                    );
+                    ExitCode::SUCCESS
+                }
+                Ok(s) => {
+                    eprintln!("porthole tunnel: kill exited with {s}");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("porthole tunnel: failed to run kill: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("porthole tunnel: unknown subcommand '{other}'");
+            eprintln!("usage: porthole tunnel [list] | kill <port>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+struct TunnelInfo {
+    pid: u32,
+    port: u16,
+    host: String,
+}
+
+/// Scan the process table for our tunnel children. Anything that is not
+/// a strict match for the daemon's spawn shape is invisible — a false
+/// negative means the tunnel admin commands miss it, never that we
+/// touch somebody else's ssh.
+fn find_tunnels() -> Vec<TunnelInfo> {
+    let Ok(out) = process::Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let (port, host) = parse_tunnel(&tokens)?;
+            Some(TunnelInfo {
+                pid: tokens[0].parse().ok()?,
+                port,
+                host: host.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Recognize one of our tunnel children in a ps line's tokens:
