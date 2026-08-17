@@ -62,6 +62,10 @@ in
     # unix socket paths (home-manager asserts paths carry no port).
     # programs.ssh.settings — matchBlocks is a deprecated alias.
     programs.ssh.settings = lib.genAttrs cfg.hosts (host: {
+      # Reap half-dead attach sessions fast: a stale forward otherwise
+      # accepts client writes into a dead channel, silently.
+      ServerAliveInterval = 15;
+      ServerAliveCountMax = 2;
       RemoteForward = [
         {
           bind.address = "${home}/.porthole.sock";

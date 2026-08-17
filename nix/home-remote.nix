@@ -25,11 +25,22 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    home.packages = [ cfg.package ];
+    # xdg-utils makes `xdg-open` exist; it reads $BROWSER, which lands
+    # on the client. The desktop entry is the fallback route through
+    # the MIME database.
+    home.packages = [
+      cfg.package
+      pkgs.xdg-utils
+    ];
 
     # Stock xdg-open and every $BROWSER reader. The package's `open`
     # symlink argv[0]-dispatches to `porthole open`.
     home.sessionVariables.BROWSER = "${cfg.package}/bin/open";
+
+    # These gates default off (or vary by hm vintage); without them the
+    # entries below silently render nothing.
+    xdg.enable = lib.mkDefault true;
+    xdg.mimeApps.enable = true;
 
     xdg.desktopEntries.porthole = {
       name = "porthole";
