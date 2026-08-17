@@ -1,5 +1,5 @@
 self:
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 # home-manager module for a NixOS remote: installs the porthole client
 # and registers it as the machine's "browser" so xdg-open, $BROWSER,
 # gio/mimeapps, and macOS-style `open` calls all route to the mac.
@@ -12,7 +12,9 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${builtins.currentSystem}.porthole-remote;
+      # pkgs comes from the module's target — builtins.currentSystem is
+      # impure and throws under pure (flake) evaluation.
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.porthole-remote;
       description = "The porthole package to install. Use the -remote build (client only, no tokio).";
     };
   };

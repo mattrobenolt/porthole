@@ -1,5 +1,5 @@
 self:
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 # home-manager module for the macOS local host: runs the daemon under
 # launchd and declares one ssh RemoteForward per managed host, from the
 # same attrset — one edit wires both halves of the contract.
@@ -13,7 +13,9 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${builtins.currentSystem}.porthole;
+      # pkgs comes from the module's target — builtins.currentSystem is
+      # impure and throws under pure (flake) evaluation.
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.porthole;
       description = "The porthole package to install (full build, daemon included).";
     };
 
@@ -51,9 +53,11 @@ in
     };
 
     # One RemoteForward per host: the remote's ~/.porthole.sock lands on
-    # the daemon's per-host socket here.
-    programs.ssh.matchBlocks = lib.genAttrs cfg.hosts (host: {
-      remoteForwards = [
+    # the daemon's per-host socket here. Address-only entries render as
+    # unix socket paths (home-manager asserts paths carry no port).
+    # programs.ssh.settings — matchBlocks is a deprecated alias.
+    programs.ssh.settings = lib.genAttrs cfg.hosts (host: {
+      RemoteForward = [
         {
           bind.address = "${home}/.porthole.sock";
           host.address = "${home}/.porthole.d/${host}.sock";
