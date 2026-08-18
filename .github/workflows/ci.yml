@@ -19,7 +19,7 @@ jobs:
         with:
           persist-credentials: false
       - name: install nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - name: nix store cache
         uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         with:
@@ -47,6 +47,18 @@ jobs:
         run: nix develop -c bash scripts/smoke-e2e.sh
       - name: nix build (both roles)
         run: nix build .#porthole .#porthole-remote
+      - name: record output paths
+        if: github.event_name == 'push'
+        id: outputs
+        run: |
+          echo "paths=$(nix path-info .#porthole .#porthole-remote | paste -sd ' ')" >> "$GITHUB_OUTPUT"
+      - name: push to cachix
+        if: github.event_name == 'push'
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: mattrobenolt
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          pathsToPush: ${{ steps.outputs.outputs.paths }}
 
   macos:
     runs-on: macos-15
@@ -60,10 +72,22 @@ jobs:
         with:
           persist-credentials: false
       - name: install nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - name: nix store cache
         uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         with:
           use-flakehub: false # GHA cache only; no FlakeHub account or OIDC
       - name: nix build (both roles, darwin)
         run: nix build .#porthole .#porthole-remote
+      - name: record output paths
+        if: github.event_name == 'push'
+        id: outputs
+        run: |
+          echo "paths=$(nix path-info .#porthole .#porthole-remote | paste -sd ' ')" >> "$GITHUB_OUTPUT"
+      - name: push to cachix
+        if: github.event_name == 'push'
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: mattrobenolt
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          pathsToPush: ${{ steps.outputs.outputs.paths }}
