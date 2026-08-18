@@ -57,5 +57,17 @@ in
       "x-scheme-handler/http" = "porthole.desktop";
       "x-scheme-handler/https" = "porthole.desktop";
     };
+
+    # Link the herdr plugin manifest so Ctrl+click on loopback URLs
+    # in herdr panes routes to `porthole open` instead of a dead
+    # browser tab. Idempotent: re-linking to the current store path
+    # on every switch keeps the registry in sync. Skipped silently
+    # when herdr is not installed or its server is not running.
+    home.activation.linkPortholeHerdrPlugin =
+      lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+        if command -v herdr >/dev/null 2>&1; then
+          herdr plugin link ${cfg.package}/share/porthole 2>/dev/null || true
+        fi
+      '';
   };
 }

@@ -1,0 +1,33 @@
+# porthole — herdr plugin manifest.
+#
+# Ctrl+click on a loopback URL in a herdr pane routes to
+# `porthole herdr-open` instead of a direct browser open. This fixes
+# the dead-browser-tab case when no tunnel exists yet.
+#
+# The manifest is optional at runtime: if herdr is not installed, every
+# other entry point (xdg-open, $BROWSER, gio, the open shim) still
+# works. The home-manager module links this manifest idempotently on
+# every switch when herdr is present.
+#
+# platforms: linux only. On macOS the daemon uses per-host sockets
+# (~/.porthole.d/<host>.sock), not ~/.porthole.sock, so `porthole
+# herdr-open` would spool uselessly. herdr's default browser open is
+# the correct behavior on the local host.
+
+id = "porthole"
+name = "porthole"
+version = "0.0.0"
+min_herdr_version = "0.8.0"
+description = "Open URLs from remote machines in the local browser, with automatic SSH tunnels for loopback ports."
+platforms = ["linux"]
+
+[[actions]]
+id = "open-url"
+title = "Open URL via porthole"
+command = ["porthole", "herdr-open"]
+
+[[link_handlers]]
+id = "loopback-http"
+title = "Open loopback URL via porthole"
+pattern = '^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(/.*)?$'
+action = "open-url"

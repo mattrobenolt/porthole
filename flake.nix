@@ -77,6 +77,10 @@
                 # stdenv's strip phase doesn't fire for us; do it.
                 strip $out/bin/porthole
                 ln -s $out/bin/porthole $out/bin/ph
+                # The herdr plugin manifest. `herdr plugin link
+                # <this dir>` reads herdr-plugin.toml from it.
+                mkdir -p $out/share/porthole
+                cp ${./herdr-plugin.toml} $out/share/porthole/herdr-plugin.toml
               ''
               + pkgs.lib.optionalString (!daemon) ''
                 # Busybox-style argv[0] dispatch makes these shims:

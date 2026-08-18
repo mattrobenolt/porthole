@@ -1,5 +1,5 @@
 //! porthole — open URLs from remote machines in the local browser.
-//! One binary, five roles: daemon, open, clipboard, status, tunnel.
+//! One binary, six roles: daemon, open, herdr-open, clipboard, status, tunnel.
 //! Symlinks named `open` or `pbcopy` dispatch to the client, busybox-style.
 
 use std::borrow::Cow;
@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
+use std::iter::once;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
@@ -27,6 +28,7 @@ usage: porthole <command> [<args>]
 commands:
   clipboard  set the local clipboard from stdin (also: pbcopy)
   daemon     run the local daemon (owned by launchd)
+  herdr-open open a URL from a herdr link handler (reads HERDR_PLUGIN_CLICKED_URL)
   open       send a URL to the daemon, spool it if unreachable
   status     show daemon and tunnel state
   tunnel     inspect or kill tunnels
@@ -39,8 +41,9 @@ const HELP: &str = "\
 porthole — open URLs from remote machines in the local browser
 
 usage:
-  porthole open <url>   send a URL to the local browser
-  porthole clipboard    set the local clipboard from stdin
+  porthole open <url>         send a URL to the local browser
+  porthole herdr-open <url>   open a URL from a herdr link handler
+  porthole clipboard          set the local clipboard from stdin
 
 This build carries the remote client only. The daemon, status, and
 tunnel roles exist in the macOS build.
@@ -74,6 +77,7 @@ fn main() -> ExitCode {
     match command.as_str() {
         "open" => open(args),
         "clipboard" => clipboard(args),
+        "herdr-open" => herdr_open(args),
         #[cfg(feature = "daemon")]
         "daemon" => daemon::run(args),
         #[cfg(feature = "daemon")]
@@ -141,6 +145,22 @@ fn open(args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `porthole herdr-open`: the herdr plugin entry point. herdr passes
+/// the clicked URL in `HERDR_PLUGIN_CLICKED_URL`. A positional arg is
+/// accepted as a fallback for manual testing outside herdr. Delegates
+/// to `open` — same validation, same socket, same spool.
+fn herdr_open(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let url =
+        env::var("HERDR_PLUGIN_CLICKED_URL").unwrap_or_else(|_| args.next().unwrap_or_default());
+    if url.is_empty() {
+        eprintln!(
+            "porthole herdr-open: no URL (set HERDR_PLUGIN_CLICKED_URL or pass one as an argument)"
+        );
+        return ExitCode::from(2);
+    }
+    open(once(url))
 }
 
 /// Deliberately blocking std I/O: one connect and a few writes, no

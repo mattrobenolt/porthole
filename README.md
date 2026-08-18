@@ -62,6 +62,11 @@ On the remote, nothing changes. Every entry point routes to the client:
 - `gio open <url>` through the registered MIME handler
 - a plain `open <url>` shim for macOS-style callers
 - `porthole open <url>` directly
+- **Ctrl+click on a loopback URL in a herdr pane** — the home-manager
+  module links a plugin manifest that routes loopback URLs to
+  `porthole open` instead of a dead browser tab. This is automatic
+  when herdr is installed; without herdr, every other entry point
+  still works.
 
 The clipboard bridges too: `cat foo.txt | pbcopy` puts stdin on the Mac's
 clipboard. Attached to a terminal this speaks OSC 52 directly and needs
