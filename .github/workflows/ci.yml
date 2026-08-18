@@ -22,6 +22,8 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - name: nix store cache
         uses: DeterminateSystems/flakehub-cache-action@e62e272c914d4ad8e4d1587a864e9c3ad2cba9de # v3.21.9
+        with:
+          use-gha-cache: "enabled" # GHA cache backend; skip FlakeHub OIDC auth
       - name: cargo registry cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -61,5 +63,7 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - name: nix store cache
         uses: DeterminateSystems/flakehub-cache-action@e62e272c914d4ad8e4d1587a864e9c3ad2cba9de # v3.21.9
+        with:
+          use-gha-cache: "enabled" # GHA cache backend; skip FlakeHub OIDC auth
       - name: nix build (both roles, darwin)
         run: nix build .#porthole .#porthole-remote

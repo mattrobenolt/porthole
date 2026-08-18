@@ -41,5 +41,7 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - name: nix store cache
         uses: DeterminateSystems/flakehub-cache-action@e62e272c914d4ad8e4d1587a864e9c3ad2cba9de # v3.21.9
+        with:
+          use-gha-cache: "enabled" # GHA cache backend; skip FlakeHub OIDC auth
       - name: verify action pinning
         run: nix develop -c pinact run --check --verify --min-age 3
