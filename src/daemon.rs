@@ -7,6 +7,7 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
@@ -57,6 +58,9 @@ async fn serve(hosts: Vec<String>) -> io::Result<()> {
     };
     let dir = home.join(".porthole.d");
     fs::create_dir_all(&dir)?;
+    // ControlPath points into this directory; ssh creates the socket
+    // file but never its parents.
+    fs::create_dir_all(dir.join("control"))?;
 
     let registry = Registry::new();
     let mut paths = Vec::new();
@@ -207,6 +211,26 @@ async fn handle_line(host: &str, line: &str, registry: &Registry) {
 }
 
 async fn handle_open(host: &str, url: &str, registry: &Registry) {
+    // OAuth-style flows: the authorize URL names the loopback callback
+    // in a query param, and the browser is redirected there without
+    // ever asking us. This is the only chance to tunnel it. Best-effort:
+    // a failure here must not keep the authorize page from loading.
+    for port in sniff_callback_ports(url) {
+        match registry.ensure(host, port).await {
+            Ok(Ensure::Started) => {
+                eprintln!("porthole daemon: {host}: pre-tunneled callback port {port}")
+            }
+            Ok(Ensure::Ready) | Ok(Ensure::LocalWins) => {}
+            Ok(Ensure::Conflict(other)) => eprintln!(
+                "porthole daemon: {host}: callback port {port} already tunneled to '{other}'"
+            ),
+            Err(e) => {
+                eprintln!(
+                    "porthole daemon: {host}: pre-tunnel for callback port {port} failed: {e}"
+                )
+            }
+        }
+    }
     match classify(url) {
         Ok(Target::Direct) => open_and_log(host, url).await,
         Ok(Target::Tunnel(port)) => match registry.ensure(host, port).await {
@@ -282,6 +306,27 @@ enum Target {
     Tunnel(u16),
 }
 
+/// Loopback ports named by any query param value that parses as a
+/// loopback URL. OAuth redirect_uri is the case that matters: the
+/// browser is redirected to the callback without passing through us,
+/// so the authorize URL's query is the only place the port is visible.
+/// Name-agnostic (redirect_uri, callback, next, ...) — a spurious
+/// tunnel costs one ssh round trip, a missed one strands the flow.
+fn sniff_callback_ports(raw: &str) -> Vec<u16> {
+    let Ok(url) = Url::parse(raw) else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for (_, value) in url.query_pairs() {
+        if let Ok(Target::Tunnel(port)) = classify(&value)
+            && !ports.contains(&port)
+        {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
 /// The daemon is the real validator; the client's scheme check is only a
 /// courtesy for fast feedback. Everything arriving on the socket is
 /// untrusted input.
@@ -351,11 +396,20 @@ pub fn status(_args: impl Iterator<Item = String>) -> ExitCode {
 
     println!("tunnels:");
     let tunnels = find_tunnels();
-    if tunnels.is_empty() {
-        println!("  (none)");
-    }
+    let muxes = find_mux();
+    let mut any = false;
     for t in &tunnels {
-        println!("  port {} → {} (pid {})", t.port, t.host, t.pid);
+        any = true;
+        println!("  port {} → {} (child pid {})", t.port, t.host, t.pid);
+    }
+    for m in &muxes {
+        for port in &m.ports {
+            any = true;
+            println!("  port {} → {} (mux, master pid {})", port, m.host, m.pid);
+        }
+    }
+    if !any {
+        println!("  (none)");
     }
 
     ExitCode::SUCCESS
@@ -385,31 +439,68 @@ pub fn tunnel(args: impl Iterator<Item = String>) -> ExitCode {
                 eprintln!("usage: porthole tunnel kill <port>");
                 return ExitCode::from(2);
             };
+            // Child tunnels: signal the ssh child directly; the daemon's
+            // reaper drops the registry entry when it exits.
             let tunnels = find_tunnels();
-            let Some(t) = tunnels.iter().find(|t| t.port == port) else {
-                eprintln!("porthole tunnel: no tunnel on port {port}");
-                return ExitCode::FAILURE;
-            };
-            let status = process::Command::new("kill")
-                .arg(t.pid.to_string())
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    println!(
-                        "killed tunnel on port {port} (pid {}, was → {})",
-                        t.pid, t.host
-                    );
-                    ExitCode::SUCCESS
-                }
-                Ok(s) => {
-                    eprintln!("porthole tunnel: kill exited with {s}");
-                    ExitCode::FAILURE
-                }
-                Err(e) => {
-                    eprintln!("porthole tunnel: failed to run kill: {e}");
-                    ExitCode::FAILURE
+            if let Some(t) = tunnels.iter().find(|t| t.port == port) {
+                let status = process::Command::new("kill")
+                    .arg(t.pid.to_string())
+                    .status();
+                return match status {
+                    Ok(s) if s.success() => {
+                        println!(
+                            "killed tunnel on port {port} (pid {}, was → {})",
+                            t.pid, t.host
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Ok(s) => {
+                        eprintln!("porthole tunnel: kill exited with {s}");
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("porthole tunnel: failed to run kill: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            // Mux forwards live inside the ssh master; cancel through
+            // its control socket.
+            if let Some(dir) = tunnel::control_dir() {
+                for m in find_mux() {
+                    if !m.ports.contains(&port) {
+                        continue;
+                    }
+                    let status = process::Command::new("ssh")
+                        .arg("-S")
+                        .arg(dir.join(&m.host))
+                        .arg("-O")
+                        .arg("cancel")
+                        .arg("-L")
+                        .arg(format!("{port}:localhost:{port}"))
+                        .arg(&m.host)
+                        .status();
+                    return match status {
+                        Ok(s) if s.success() => {
+                            println!(
+                                "canceled mux forward on port {port} (→ {}, master pid {})",
+                                m.host, m.pid
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Ok(s) => {
+                            eprintln!("porthole tunnel: ssh -O cancel exited with {s}");
+                            ExitCode::FAILURE
+                        }
+                        Err(e) => {
+                            eprintln!("porthole tunnel: failed to run ssh -O cancel: {e}");
+                            ExitCode::FAILURE
+                        }
+                    };
                 }
             }
+            eprintln!("porthole tunnel: no tunnel on port {port}");
+            ExitCode::FAILURE
         }
         Some(other) => {
             eprintln!("porthole tunnel: unknown subcommand '{other}'");
@@ -423,6 +514,93 @@ struct TunnelInfo {
     pid: u32,
     port: u16,
     host: String,
+}
+
+struct MuxInfo {
+    host: String,
+    pid: u32,
+    ports: Vec<u16>,
+}
+
+/// Mux forwards live inside the user's ssh master, invisible to the
+/// process-table shape find_tunnels matches. Ground truth is the
+/// control socket directory (one socket per host, named by alias) plus
+/// lsof on the master's pid — the same "the process table is the shared
+/// state" philosophy, one level up. User-added `-L` forwards on the
+/// same master are indistinguishable from ours and are listed too.
+fn find_mux() -> Vec<MuxInfo> {
+    let Some(dir) = tunnel::control_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let is_socket = entry.file_type().map(|t| t.is_socket()).unwrap_or(false);
+        if !is_socket {
+            continue;
+        }
+        let host = entry.file_name().to_string_lossy().into_owned();
+        let check = process::Command::new("ssh")
+            .arg("-S")
+            .arg(entry.path())
+            .arg("-O")
+            .arg("check")
+            .arg(&host)
+            .output();
+        let Ok(check) = check else { continue };
+        if !check.status.success() {
+            continue;
+        }
+        // "Master running (pid=...)" goes to stderr; be liberal about it.
+        let text = String::from_utf8_lossy(&check.stderr).into_owned()
+            + &String::from_utf8_lossy(&check.stdout);
+        let Some(pid) = parse_master_pid(&text) else {
+            continue;
+        };
+        let ports = lsof_listen_ports(pid);
+        out.push(MuxInfo { host, pid, ports });
+    }
+    out
+}
+
+/// "Master running (pid=12345)" — the payload of `ssh -O check`.
+fn parse_master_pid(text: &str) -> Option<u32> {
+    let start = text.find("pid=")? + 4;
+    let end = text[start..].find(')')? + start;
+    text[start..end].parse().ok()
+}
+
+/// Loopback TCP listen ports owned by pid, via lsof. The master's
+/// listening sockets are exactly its local forwards.
+fn lsof_listen_ports(pid: u32) -> Vec<u16> {
+    let Ok(out) = process::Command::new("lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout.lines().filter_map(parse_lsof_listen).collect()
+}
+
+/// One listening loopback port from an lsof output line, or None.
+/// Lines look like:
+///   ssh  1234  matt  9u  IPv4  0x...  0t0  TCP 127.0.0.1:3000 (LISTEN)
+///   ssh  1234  matt  9u  IPv6  0x...  0t0  TCP [::1]:3000 (LISTEN)
+fn parse_lsof_listen(line: &str) -> Option<u16> {
+    let line = line.trim();
+    if !line.ends_with("(LISTEN)") {
+        return None;
+    }
+    let mut tokens = line.split_whitespace();
+    let addr = tokens.find(|t| *t == "TCP").and_then(|_| tokens.next())?;
+    let (host, port) = addr.rsplit_once(':')?;
+    if !(host == "127.0.0.1" || host == "[::1]" || host == "localhost") {
+        return None;
+    }
+    port.parse().ok()
 }
 
 /// Scan the process table for our tunnel children. Anything that is not
@@ -474,7 +652,7 @@ fn parse_tunnel<'a>(tokens: &[&'a str]) -> Option<(u16, &'a str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_tunnel;
+    use super::{parse_lsof_listen, parse_master_pid, parse_tunnel, sniff_callback_ports};
 
     #[test]
     fn parses_our_tunnel() {
@@ -508,6 +686,109 @@ mod tests {
         assert_eq!(parse_tunnel(&["1", "sshd", "-D"]), None);
         assert_eq!(parse_tunnel(&["1", "ssh", "dev1", "echo", "hi"]), None);
         assert_eq!(parse_tunnel(&["1", "nc", "-k", "-l", "3000"]), None);
+    }
+
+    #[test]
+    fn sniff_finds_callback_ports() {
+        // Azure CLI authorize URL: RFC 8252 loopback redirect_uri.
+        assert_eq!(
+            sniff_callback_ports(
+                "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?client_id=xxx&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A38947&scope=https%3A%2F%2Fmanagement.core.windows.net%2F%2F.default+offline_access&state=xxx&code_challenge=xxx&code_challenge_method=S256"
+            ),
+            vec![38947]
+        );
+        // gcloud authorize URL.
+        assert_eq!(
+            sniff_callback_ports(
+                "https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=x.apps.googleusercontent.com&redirect_uri=http%3A%2F%2Flocalhost%3A8085%2F&scope=openid&state=xxx&access_type=offline&code_challenge=xxx&code_challenge_method=S256"
+            ),
+            vec![8085]
+        );
+        // Name-agnostic: any param value that is a loopback URL counts.
+        assert_eq!(
+            sniff_callback_ports(
+                "https://accounts.google.com/o/oauth2?callback=http%3A%2F%2F127.0.0.1%3A12345%2Fcb"
+            ),
+            vec![12345]
+        );
+        // IPv6 loopback, percent-encoded brackets and all.
+        assert_eq!(
+            sniff_callback_ports(
+                "https://idp.example.com/auth?redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A9999%2Fcb"
+            ),
+            vec![9999]
+        );
+        // Distinct loopback params all tunnel, first-seen order, deduped.
+        assert_eq!(
+            sniff_callback_ports(
+                "https://example.com/?a=http%3A%2F%2Flocalhost%3A9999&b=http%3A%2F%2Flocalhost%3A8888&c=http%3A%2F%2Flocalhost%3A9999"
+            ),
+            vec![9999, 8888]
+        );
+    }
+
+    #[test]
+    fn sniff_ignores_non_loopback_and_junk() {
+        // Hosted redirect: nothing to tunnel.
+        assert!(
+            sniff_callback_ports(
+                "https://example.com/?redirect_uri=https%3A%2F%2Fexample.com%2Fcallback"
+            )
+            .is_empty()
+        );
+        // Relative values are not URLs.
+        assert!(sniff_callback_ports("https://example.com/?next=%2Flocal%2Fpath").is_empty());
+        // Private-use schemes fail validation; out of scope.
+        assert!(
+            sniff_callback_ports("https://example.com/?redirect_uri=com.example.app%3A%2Fcb")
+                .is_empty()
+        );
+        assert!(sniff_callback_ports("https://example.com/no-query").is_empty());
+        assert!(sniff_callback_ports("not a url").is_empty());
+        assert!(sniff_callback_ports("").is_empty());
+    }
+
+    #[test]
+    fn master_pid_parses() {
+        assert_eq!(
+            parse_master_pid("Master running (pid=12345)\r\n"),
+            Some(12345)
+        );
+        assert_eq!(parse_master_pid("Master running (pid=7)"), Some(7));
+        assert_eq!(parse_master_pid("No master"), None);
+        assert_eq!(parse_master_pid("pid=abc)"), None);
+    }
+
+    #[test]
+    fn lsof_listen_parses() {
+        assert_eq!(
+            parse_lsof_listen("sshd 1234 matt 9u IPv4 0x1 0t0 TCP 127.0.0.1:3000 (LISTEN)"),
+            Some(3000)
+        );
+        assert_eq!(
+            parse_lsof_listen("sshd 1234 matt 9u IPv6 0x2 0t0 TCP [::1]:8085 (LISTEN)"),
+            Some(8085)
+        );
+        // Wildcard and non-loopback binds are not porthole forwards.
+        assert_eq!(
+            parse_lsof_listen("sshd 1234 matt 9u IPv4 0x1 0t0 TCP *:3000 (LISTEN)"),
+            None
+        );
+        assert_eq!(
+            parse_lsof_listen("sshd 1234 matt 9u IPv4 0x1 0t0 TCP 10.0.0.2:3000 (LISTEN)"),
+            None
+        );
+        // Non-listen lines and the header never match.
+        assert_eq!(
+            parse_lsof_listen(
+                "sshd 1234 matt 3u IPv4 0x3 0t0 TCP 127.0.0.1:22->127.0.0.1:55555 (ESTABLISHED)"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_lsof_listen("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME"),
+            None
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 # porthole — Architecture
 
-Status: plan. Nothing is built. Name: `porthole`. The CLI installs as `porthole` with a `ph` symlink.
+Status: built and smoke-tested. Name: `porthole`. The CLI installs as `porthole` with a `ph` symlink.
 
 Primary targets: macOS as the local host, NixOS as the remote OS. Everything else is secondary.
 
@@ -9,6 +9,8 @@ Primary targets: macOS as the local host, NixOS as the remote OS. Everything els
 porthole opens URLs from remote machines in the local macOS browser. A tool on a NixOS remote calls `xdg-open <url>` or any equivalent entry point. The URL arrives in the default macOS browser.
 
 If the URL targets a loopback port on the remote, the system first creates an SSH tunnel for that port. The browser then reaches the remote service through the tunnel. The user does nothing.
+
+OAuth flows get the same treatment from the other direction. The authorize URL carries the loopback callback in its query (`redirect_uri` and friends), and the browser is redirected there without porthole ever seeing that URL. The daemon sniffs the callback port out of every opened URL's query parameters and pre-tunnels it, so the IdP's redirect back to localhost lands on a live tunnel.
 
 ## 2. Design rules
 
@@ -25,7 +27,7 @@ If the URL targets a loopback port on the remote, the system first creates an SS
 
 **Socket directory.** `~/.porthole.d/<host>.sock`. The socket file name identifies the source host. This solves multi-host attribution without metadata or mapping tables.
 
-**Tunnel registry.** Tracks `ssh -N -L <port>:localhost:<port> <host>` children per host and port. In v1, tunnels live for the daemon lifetime.
+**Tunnel registry.** Tracks one ssh port forward per host and port. Two mechanisms, one policy. When the host's session multiplexes — the generated ssh config sets `ControlPath ~/.porthole.d/control/%n`, so the control socket name is the host alias the daemon already knows — a forward is one synchronous `ssh -S <sock> -O forward -L <port>:localhost:<port>` round trip to the live master. Nothing to spawn or supervise, and forwards die with the connection, which is the right lifetime. Sessions without a control socket (hand-rolled configs) get a spawned `ssh -N -L` child instead, reaped on exit. In v1, tunnels live for the connection (mux) or the daemon lifetime (child).
 
 **CLI.** The same binary. Subcommands: `daemon`, `open`, `status`, `tunnel`. The nix module installs the binary as `porthole` plus a `ph` symlink for typing.
 
@@ -73,7 +75,7 @@ sequenceDiagram
   alt port 8888 already bound locally
     D->>B: open http://localhost:8888
   else no local listener
-    D->>N: ensure tunnel: ssh -N -L 8888:localhost:8888 dev1
+    D->>N: ensure tunnel: ssh -O forward via control socket (fallback: spawned ssh -N -L)
     N-->>D: tunnel ready
     D->>B: open http://localhost:8888
   end
@@ -99,7 +101,7 @@ flowchart TB
   subgraph M["macOS host"]
     SK["~/.porthole.d/&lt;host&gt;.sock"]
     D["porthole daemon (launchd-owned)"]
-    TR["Tunnel registry: ssh -N -L per host:port"]
+    TR["Tunnel registry: ssh -O forward per host:port via control socket (fallback: spawned ssh -N -L)"]
     BR["macOS open → browser"]
     SK --> D
     D --> TR
@@ -129,9 +131,11 @@ Two remotes can serve the same loopback port at the same time. The first tunnel 
 ## 8. Failure modes
 
 - **No ssh session to the remote.** The remote socket is dead. The client appends to the spool. The next successful call flushes it. URLs from detached agents arrive late, not never.
-- **Daemon restart.** Tunnels are children of the daemon, so a restart drops them. The next URL recreates them on demand.
+- **Daemon restart.** Mux forwards belong to the ssh connection and survive; the restarted daemon's first ensure finds the port already bound and treats it as local-wins — the correct outcome behind a confusing log line. Spawned child tunnels die with the daemon; the next URL recreates them on demand.
+- **Disconnect is soft.** ControlPersist keeps the ssh master (and with it the RemoteForward and any mux forwards) alive for an hour after the last session closes. URLs keep arriving until it expires; after that, the client spools.
 - **Stale remote socket after a dropped connection.** `StreamLocalBindUnlink` replaces it on the next connect.
 - **Local port already bound by an unrelated local process.** Local wins. The daemon opens the URL without a tunnel and logs the decision. Explicit remapping is the escape hatch.
+- **Callback URLs the sniff cannot see.** SAML CLI flows hide the ACS URL inside the base64 SAMLRequest blob; oauth-proxy interstitials double-encode it. Those flows break at the redirect. If one bites, the fix is an explicit `porthole forward <port>` verb on the remote — a one-line protocol addition, deliberately not built yet.
 - **herdr not installed.** Everything except click routing still works.
 
 ## 9. What we build
@@ -156,5 +160,5 @@ Scope notes, not doctrine — most of these fall when they itch. Two are load-be
 
 - Implementation language: decided (2026-08-16). Rust, single-threaded tokio (`new_current_thread`; `rt-multi-thread` not compiled in). Hand-rolled CLI parsing, no clap. No tracing/anyhow until structure earns it.
 - Tunnel idle and teardown policy past v1.
-- Multiplexed tunnel architecture: considered and rejected (2026-08-17). A single porthole-to-porthole mux per host (own both sockets, real observability) breaks the load-bearing rule — no daemon on remotes — and replaces the zero-code ssh tunnel layer with a hand-rolled wire protocol (framing, flow control, versioning). If per-port process count ever matters, ControlMaster + `ssh -O forward` multiplexes over one connection without new code. If true traffic observability ever matters, idle detection's composite signal (last_requested + lsof established check) is the cheap answer. This is the sshuttle shape: a good different project.
+- Multiplexed tunnel architecture: considered and rejected (2026-08-17). A single porthole-to-porthole mux per host (own both sockets, real observability) breaks the load-bearing rule — no daemon on remotes — and replaces the zero-code ssh tunnel layer with a hand-rolled wire protocol (framing, flow control, versioning). If true traffic observability ever matters, idle detection's composite signal (last_requested + lsof established check) is the cheap answer. This is the sshuttle shape: a good different project. The rejection's own escape hatch was adopted (2026-08-18): per-port forwards now go through ControlMaster + `ssh -O forward` on the session's control socket, with spawned `ssh -N -L` children as the fallback. The trigger was OAuth callback pre-tunneling (sniffing `redirect_uri`-style loopback URLs out of opened URLs' query parameters), which made per-port process spawns feel silly; rcrowley's opener branch proved the pattern. Note the attribution story differs from opener's: porthole needs no in-band %C metadata because the per-host RemoteForward socket names the host, and `ControlPath %n` makes host → control socket a path join.
 - Spool size limits and flush triggers past "next successful call". Includes staleness: the spool stays in $HOME because /run/user/$UID can vanish under detached agents (logind removes it at last logout without linger). If post-reboot delivery of dead loopback URLs ever bites, stamp spool lines with /proc/sys/kernel/random/boot_id and discard on mismatch — /run semantics without /run fragility. Also open: flush *timing* — "next successful call" delivers stale URLs at random mid-session moments; flushing on session establishment (ssh attach / login hook) arrives at the least surprising moment. And a TTL on flush, since the transport can't see intent: an SSO login link and a dev-server URL differ only in shelf life, and TTL approximates shelf life.

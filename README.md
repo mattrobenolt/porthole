@@ -8,12 +8,23 @@ If the URL points at a loopback port on the remote, porthole first creates an
 SSH tunnel for that port. The browser then reaches the remote service through
 the tunnel. You do nothing.
 
+OAuth flows work too. An authorize URL carries its loopback callback in the
+query string (`redirect_uri` and friends), and the browser is redirected
+there without porthole ever seeing that URL. The daemon sniffs the callback
+port out of every URL it opens and pre-tunnels it, so the identity provider's
+redirect back to localhost lands on a live tunnel.
+
 ## How it works
 
 - One binary serves every role: client, daemon, and admin tool.
 - The remote runs no daemon. The client writes one JSON line to a Unix socket.
 - SSH carries the socket through a `RemoteForward` from your Mac.
 - The daemon on macOS validates the URL, manages tunnels, and calls `open(1)`.
+- Tunnels ride the session's own multiplexed SSH connection: the home-manager
+  module sets `ControlMaster auto` and `ControlPath ~/.porthole.d/control/%n`
+  per host, so a tunnel is one `ssh -O forward` round trip — no extra ssh
+  processes, and forwards die with the connection. Sessions without a control
+  socket get a spawned `ssh -N -L` instead.
 - If no SSH session is up, the client spools the URL to disk. The next
   successful call flushes the spool, oldest first.
 

@@ -12,9 +12,11 @@ cargo build -q
 
 T=$(mktemp -d)
 PIDS=()
-ATTACH=""
 cleanup() {
-    [ -n "$ATTACH" ] && kill "$ATTACH" 2>/dev/null || true
+    # With ControlMaster in the rig config, the attach session daemonizes:
+    # $! dies at the fork and the master lives on. `-O exit` is the only
+    # deterministic teardown — kill the master, its forwards die with it.
+    PATH="$T/bin:$PATH" HOME="$T" ssh -O exit remote1 2>/dev/null || true
     for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
     # The trap kills the service's loop subshell; this kills the nc child
     # it may have spawned mid-listen. Orphans hold our stdout pipe open
@@ -72,6 +74,11 @@ Host remote1
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR
+    # Production parity: the home-manager module multiplexes sessions
+    # so the daemon can add forwards with ssh -O forward on the master.
+    ControlMaster auto
+    ControlPath $T/.porthole.d/control/%n
+    ControlPersist 60m
 EOF
 chmod 700 "$T/.ssh"; chmod 600 "$T/.ssh/config"
 
@@ -102,8 +109,8 @@ PIDS+=($!)
 sleep 0.5
 
 echo "== attach: the RemoteForward session (production: mac -> remote) =="
+echo "   (ControlMaster daemonizes the -N session; teardown is ssh -O exit) =="
 ssh -N -R "$T/.porthole.sock:$T/.porthole.d/remote1.sock" remote1 &
-ATTACH=$!
 for _ in $(seq 1 50); do [ -S "$T/.porthole.sock" ] && break; sleep 0.1; done
 [ -S "$T/.porthole.sock" ] || { echo "FAIL: forwarded socket never appeared"; cat "$T/sshd.log"; exit 1; }
 echo "   forwarded socket is live"
@@ -120,8 +127,7 @@ sleep 0.5
 echo "==   service sanity check: $(curl -s http://localhost:8888/) =="
 
 echo "== 3. drop the session: client spools =="
-kill "$ATTACH"
-ATTACH=""
+ssh -O exit remote1
 # Wait for sshd to tear down the dead session's forward. Racing this is
 # how you connect to a stale socket file.
 for _ in $(seq 1 30); do [ ! -S "$T/.porthole.sock" ] && break; sleep 0.1; done
@@ -130,7 +136,6 @@ echo "   spool contents: $(cat "$T/.porthole.spool")"
 
 echo "== 4. re-attach (StreamLocalBindUnlink replaces the stale socket) =="
 ssh -N -R "$T/.porthole.sock:$T/.porthole.d/remote1.sock" remote1 2>"$T/reattach.log" &
-ATTACH=$!
 ok=""
 for _ in $(seq 1 50); do [ -S "$T/.porthole.sock" ] && ok=1 && break; sleep 0.1; done
 [ -n "$ok" ] || { echo "FAIL: re-attach"; cat "$T/reattach.log"; exit 1; }
@@ -146,7 +151,27 @@ done
 ./target/debug/porthole open https://flush.example.com
 sleep 0.5
 
-echo "== opened.log (expect: e2e, localhost:8888, spooled, flush — in order) =="
+echo "== 5. oauth-style URL: sniffed callback port forwarded via the control socket =="
+./target/debug/porthole open 'https://login.example.com/oauth2/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A8899%2Fcallback&state=y'
+ok=""
+for _ in $(seq 1 30); do nc -z 127.0.0.1 8899 && ok=1 && break; sleep 0.2; done
+[ -n "$ok" ] || { echo "FAIL: sniffed callback port never forwarded"; cat "$T/daemon.log"; exit 1; }
+echo "   callback port 8899 accepts (mux forward live on the real ssh master)"
+
+echo "== 6. status sees the mux forward (lsof on the master pid) =="
+./target/debug/porthole status | tee "$T/status.out"
+grep -q 'port 8899 → remote1 (mux' "$T/status.out" || { echo "FAIL: status missed the mux forward"; exit 1; }
+
+echo "== 7. tunnel kill cancels the mux forward =="
+./target/debug/porthole tunnel kill 8899
+sleep 0.3
+if nc -z 127.0.0.1 8899 2>/dev/null; then
+    echo "FAIL: forward survived tunnel kill"
+    exit 1
+fi
+echo "   forward gone"
+
+echo "== opened.log (expect: e2e, localhost:8888, spooled, flush, authorize — in order) =="
 cat "$T/opened.log"
 echo "== daemon log =="
 cat "$T/daemon.log"

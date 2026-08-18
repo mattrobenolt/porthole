@@ -109,6 +109,9 @@
               netcat
               # smoke-e2e runs a user-mode sshd.
               openssh
+              # `porthole status`/`tunnel kill` list mux forwards via
+              # lsof on the ssh master's pid.
+              lsof
               # Task runner + GitHub Actions hygiene tooling. CI runs
               # both of these in the security workflow.
               just

@@ -66,6 +66,14 @@ in
       # accepts client writes into a dead channel, silently.
       ServerAliveInterval = 15;
       ServerAliveCountMax = 2;
+      # Multiplex every session to a porthole host over one connection.
+      # The daemon then creates tunnels as `ssh -O forward` round trips
+      # on the live master instead of spawning one ssh process per port.
+      # %n is the alias as typed, which is exactly the host name the
+      # daemon learns from its socket file — no mapping table.
+      ControlMaster = "auto";
+      ControlPath = "${home}/.porthole.d/control/%n";
+      ControlPersist = "60m";
       RemoteForward = [
         {
           bind.address = "${home}/.porthole.sock";
