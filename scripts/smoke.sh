@@ -72,8 +72,15 @@ echo "== daemon2 log =="
 cat "$T/daemon2.log"
 
 echo "== 6. junk flood: 200KB without a newline gets the connection cut =="
-head -c 200000 /dev/zero | nc -N -U "$T/.porthole.sock"
+# Client-side write errors are expected: the daemon cuts the connection
+# mid-flood and which pipe end notices first is a race. The assertions
+# live in the daemon's log and its survival, not the client's exit code.
+head -c 200000 /dev/zero | nc -N -U "$T/.porthole.sock" || true
 sleep 0.3
+if ! grep -q "line over 65536 bytes" "$T/daemon2.log"; then
+    echo "FAIL: daemon never logged the oversized-line cut"; exit 1
+fi
+echo "   daemon logged the cut"
 echo "== daemon survives and still serves =="
 ./target/debug/porthole open https://after-junk.example.com
 sleep 0.3
