@@ -51,7 +51,7 @@ jobs:
         if: github.event_name == 'push'
         id: outputs
         run: |
-          echo "paths=$(nix path-info .#porthole .#porthole-remote | paste -sd ' ')" >> "$GITHUB_OUTPUT"
+          echo "paths=$(nix path-info .#porthole .#porthole-remote | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
       - name: push to cachix
         if: github.event_name == 'push'
         uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
@@ -83,7 +83,7 @@ jobs:
         if: github.event_name == 'push'
         id: outputs
         run: |
-          echo "paths=$(nix path-info .#porthole .#porthole-remote | paste -sd ' ')" >> "$GITHUB_OUTPUT"
+          echo "paths=$(nix path-info .#porthole .#porthole-remote | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
       - name: push to cachix
         if: github.event_name == 'push'
         uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
