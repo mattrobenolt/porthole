@@ -37,6 +37,15 @@ in
     # symlink argv[0]-dispatches to `porthole open`.
     home.sessionVariables.BROWSER = "${cfg.package}/bin/open";
 
+    # Some tools gate browser launches on a display check and never
+    # consult $BROWSER: gcloud's check_browser.py requires DISPLAY,
+    # WAYLAND_DISPLAY, or MIR_SOCKET before it calls webbrowser.open().
+    # Spoof DISPLAY so those gates pass — the browser they then launch
+    # is porthole. xdg-open also flips to its display-gated MIME route,
+    # which lands on porthole.desktop. On a headless remote nothing
+    # genuinely wants X, so the dead :0 costs nothing.
+    home.sessionVariables.DISPLAY = ":0";
+
     # mimeApps has its own enable gate (off by default).
     xdg.mimeApps.enable = true;
 

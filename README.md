@@ -85,10 +85,13 @@ nothing else running. Detached, it goes through the daemon. Clipboard
 writes are never spooled — a late paste would clobber the current
 clipboard with stale content.
 
-Note: on a headless remote, xdg-open consults the MIME database only when
-a display is present (`has_display` in xdg-open). The reliable route there
-is `$BROWSER`. home-manager sets it, but only if your shell sources
-home-manager's session variables file.
+Note: some tools refuse to open a browser when no display is present.
+xdg-open consults the MIME database only under `has_display`, and gcloud
+(`check_browser.py`) skips the browser entirely unless `DISPLAY`,
+`WAYLAND_DISPLAY`, or `MIR_SOCKET` is set — it never reads `$BROWSER`.
+The module sets `DISPLAY=:0` to pass these gates; the browser they reach
+is porthole. Your shell must source home-manager's session variables file
+for any of this to take effect.
 
 On the Mac, `porthole status` shows the listening sockets and live tunnels.
 `ph` is a short symlink for the impatient.

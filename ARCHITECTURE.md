@@ -39,7 +39,7 @@ OAuth flows get the same treatment from the other direction. The authorize URL c
 
 **Client.** The `open` subcommand. It writes one JSON line to `~/.porthole.sock`. If the socket is absent or refused, it appends to `~/.porthole.spool`. Each invocation flushes the spool first when the socket accepts connections.
 
-**Browser registration.** Fully declarative through home-manager. `xdg.desktopEntries` provides `porthole.desktop`. `xdg.mimeApps.defaultApplications` binds `x-scheme-handler/http` and `x-scheme-handler/https`. `home.sessionVariables.BROWSER` covers stock `xdg-open` and every tool that reads `$BROWSER`. A small `open` shim covers macOS-style calls. Debian alternatives do not apply on NixOS.
+**Browser registration.** Fully declarative through home-manager. `xdg.desktopEntries` provides `porthole.desktop`. `xdg.mimeApps.defaultApplications` binds `x-scheme-handler/http` and `x-scheme-handler/https`. `home.sessionVariables.BROWSER` covers stock `xdg-open` and every tool that reads `$BROWSER`. A small `open` shim covers macOS-style calls. `home.sessionVariables.DISPLAY` spoofs a display for launchers that gate on one (gcloud's `check_browser.py` requires `DISPLAY`, `WAYLAND_DISPLAY`, or `MIR_SOCKET` and never reads `$BROWSER`). Debian alternatives do not apply on NixOS.
 
 **sshd hygiene.** `services.openssh.settings.StreamLocalBindUnlink = true` lets sshd replace a stale remote socket on reconnect.
 
