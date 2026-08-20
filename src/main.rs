@@ -1,6 +1,7 @@
 //! porthole — open URLs from remote machines in the local browser.
 //! One binary, six roles: daemon, open, herdr-open, clipboard, status, tunnel.
-//! Symlinks named `open` or `pbcopy` dispatch to the client, busybox-style.
+//! Symlinks named `open`, `pbcopy`, or `lemonade` dispatch to the
+//! client, busybox-style.
 
 use std::borrow::Cow;
 use std::env;
@@ -60,12 +61,14 @@ fn main() -> ExitCode {
         })
         .unwrap_or_default();
 
-    // Multicall: the nix module symlinks `open` and `pbcopy` to this
-    // binary on remotes, so macOS-style callers and $BROWSER work
-    // without wrapper scripts.
+    // Multicall: the nix module symlinks `open`, `pbcopy`, and
+    // `lemonade` to this binary on remotes, so macOS-style callers,
+    // $BROWSER, and Neovim's clipboard probe work without wrapper
+    // scripts.
     match invoked_as.as_str() {
         "open" => return open(args),
         "pbcopy" => return clipboard(args),
+        "lemonade" => return lemonade(args),
         _ => {}
     }
 
@@ -299,6 +302,29 @@ fn clipboard(_args: impl Iterator<Item = String>) -> ExitCode {
         Err(e) => {
             eprintln!("porthole clipboard: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `lemonade` impersonation: of every clipboard provider Neovim probes
+/// for, this is the only one with no environment gate — no has('mac'),
+/// no $DISPLAY, no $WAYLAND_DISPLAY, just `executable('lemonade')`.
+/// Under this name the bridge is auto-detected on any remote, SSH
+/// sessions included, with zero editor configuration.
+///
+/// The dialect is two subcommands. `copy` is the clipboard role.
+/// `paste` would need a read path on the daemon that does not exist
+/// yet; fail loudly rather than silently paste nothing.
+fn lemonade(mut args: impl Iterator<Item = String>) -> ExitCode {
+    match args.next().as_deref() {
+        Some("copy") => clipboard(args),
+        Some("paste") => {
+            eprintln!("porthole lemonade: paste is not implemented (the bridge is one-way)");
+            ExitCode::FAILURE
+        }
+        _ => {
+            eprintln!("usage: lemonade copy");
+            ExitCode::from(2)
         }
     }
 }

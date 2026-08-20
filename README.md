@@ -81,9 +81,13 @@ On the remote, nothing changes. Every entry point routes to the client:
 
 The clipboard bridges too: `cat foo.txt | pbcopy` puts stdin on the Mac's
 clipboard. Attached to a terminal this speaks OSC 52 directly and needs
-nothing else running. Detached, it goes through the daemon. Clipboard
-writes are never spooled — a late paste would clobber the current
-clipboard with stale content.
+nothing else running. Detached, it goes through the daemon. The binary
+also answers to `lemonade` — the one clipboard provider Neovim probes
+for with no display-server gate — so on remotes every Neovim yanks to
+the Mac with zero editor configuration. The bridge is one-way:
+`lemonade paste` fails loudly rather than paste nothing silently.
+Clipboard writes are never spooled — a late paste would clobber the
+current clipboard with stale content.
 
 Note: some tools refuse to open a browser when no display is present.
 xdg-open consults the MIME database only under `has_display`, and gcloud

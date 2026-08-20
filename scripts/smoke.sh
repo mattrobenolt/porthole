@@ -93,6 +93,22 @@ printf 'hello clipboard' | ./target/debug/porthole clipboard
 sleep 0.3
 echo "--- clipboard capture:" && cat "$T/clipboard.txt"
 
+echo "== 7b. lemonade impersonation (Neovim's ungated probe) =="
+ln -s "$PWD/target/debug/porthole" "$T/lemonade"
+# stdout redirected to a file: forces the detached path even when the
+# script itself runs on a tty.
+printf 'via lemonade' | "$T/lemonade" copy > "$T/lemonade.out"
+sleep 0.3
+if [ "$(cat "$T/clipboard.txt")" = "via lemonade" ]; then
+    echo "   lemonade copy reached the daemon"
+else
+    echo "FAIL: lemonade copy did not reach the daemon"; exit 1
+fi
+rc=0; "$T/lemonade" paste >/dev/null 2>&1 || rc=$?
+[ "$rc" = 1 ] && echo "   lemonade paste fails loudly (exit=1)" || { echo "FAIL: paste exit=$rc"; exit 1; }
+rc=0; "$T/lemonade" >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && echo "   bare lemonade prints usage (exit=2)" || { echo "FAIL: bare exit=$rc"; exit 1; }
+
 echo "== 8. clipboard, attached (stdout is a tty → OSC 52, no daemon) =="
 expected=$(printf 'term-test' | base64 -w 0)
 if command -v script >/dev/null; then
