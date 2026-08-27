@@ -22,6 +22,7 @@ use tokio::time::sleep;
 use url::Url;
 
 use crate::Request;
+use crate::connection::Supervisor;
 use crate::tunnel::{self, Ensure, Registry};
 
 /// Entry point for `porthole daemon <host>...`.
@@ -61,16 +62,33 @@ async fn serve(hosts: Vec<String>) -> io::Result<()> {
     // ControlPath points into this directory; ssh creates the socket
     // file but never its parents.
     fs::create_dir_all(dir.join("control"))?;
+    // The supervisor's master sockets live here, separate from the
+    // user's interactive-session ControlPath.
+    fs::create_dir_all(dir.join("master"))?;
 
     let registry = Registry::new();
+
+    // Start persistent SSH masters — one per host. Each carries the
+    // RemoteForward (request delivery from the remote) and serves as
+    // the control socket for on-demand `-L` tunnel forwards. The
+    // supervisor auto-reconnects when the connection dies (laptop
+    // sleep, network loss), so the daemon never depends on
+    // externally-managed SSH sessions.
+    let supervisor = Supervisor::new();
+    supervisor.start(hosts.clone());
+
     let mut paths = Vec::new();
     let mut tasks = Vec::new();
-    for host in hosts {
+    for host in &hosts {
         let path = dir.join(format!("{host}.sock"));
         let listener = bind_listener(&path)?;
         eprintln!("porthole daemon: {host}: listening on {}", path.display());
         paths.push(path);
-        tasks.push(tokio::spawn(accept_loop(listener, host, registry.clone())));
+        tasks.push(tokio::spawn(accept_loop(
+            listener,
+            host.clone(),
+            registry.clone(),
+        )));
     }
 
     // Shutdown watchers, one per signal. (No tokio::select! here: the
@@ -80,9 +98,16 @@ async fn serve(hosts: Vec<String>) -> io::Result<()> {
         SignalKind::terminate(),
         "SIGTERM",
         registry.clone(),
+        supervisor.clone(),
         paths.clone(),
     );
-    spawn_shutdown_watcher(SignalKind::interrupt(), "SIGINT", registry.clone(), paths);
+    spawn_shutdown_watcher(
+        SignalKind::interrupt(),
+        "SIGINT",
+        registry.clone(),
+        supervisor.clone(),
+        paths,
+    );
 
     // Accept loops never return Ok; the first task to finish is the
     // first failure, and its error tears the daemon down.
@@ -99,6 +124,7 @@ fn spawn_shutdown_watcher(
     kind: SignalKind,
     name: &'static str,
     registry: Registry,
+    supervisor: Supervisor,
     paths: Vec<PathBuf>,
 ) {
     tokio::spawn(async move {
@@ -113,6 +139,9 @@ fn spawn_shutdown_watcher(
             return;
         }
         eprintln!("porthole daemon: {name}, shutting down");
+        // Stop the masters first (ssh -O exit, no respawn), then kill
+        // child tunnels, then unlink sockets.
+        supervisor.shutdown().await;
         registry.cancel_all();
         for path in &paths {
             if let Err(e) = fs::remove_file(path) {

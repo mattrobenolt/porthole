@@ -2,31 +2,35 @@
 # Full end-to-end test over REAL ssh on one machine. This box plays both
 # roles: the "remote" (porthole open + spool) and the "local" (daemon +
 # tunnels). A user-mode sshd on 127.0.0.1:2222 provides the actual
-# transport: the RemoteForward socket is created by sshd for real, the
-# daemon's tunnel is a real `ssh -N -L`, and curl proves bytes flow.
+# transport. The daemon's supervisor owns the SSH master connection
+# (carrying the RemoteForward) and auto-reconnects when it drops.
 # Only the browser is simulated (PORTHOLE_OPENER).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 cargo build -q
 
-T=$(mktemp -d)
+T="/tmp/porthole-e2e-$$"
+mkdir -p "$T"
 PIDS=()
+SSHD_PID=""
 cleanup() {
-    # With ControlMaster in the rig config, the attach session daemonizes:
-    # $! dies at the fork and the master lives on. `-O exit` is the only
-    # deterministic teardown — kill the master, its forwards die with it.
-    PATH="$T/bin:$PATH" HOME="$T" ssh -O exit remote1 2>/dev/null || true
+    # Stop the supervisor's master via its control socket.
+    PATH="$T/bin:$PATH" HOME="$T" ssh -O exit -S "$T/.porthole.d/master/remote1" remote1 2>/dev/null || true
     for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
-    # The trap kills the service's loop subshell; this kills the nc child
-    # it may have spawned mid-listen. Orphans hold our stdout pipe open
-    # and the caller never sees EOF.
     pkill -f "nc -l 127.0.0.1 8888" 2>/dev/null || true
     rm -rf "$T"
 }
 trap cleanup EXIT
 
 SSHD=$(command -v sshd)  # sshd re-execs itself; must be absolute
+
+start_sshd() {
+    "$SSHD" -f "$T/sshd_config" -E "$T/sshd.log" -D &
+    SSHD_PID=$!
+    PIDS+=("$SSHD_PID")
+    for _ in $(seq 1 50); do nc -z 127.0.0.1 2222 && break; sleep 0.1; done
+}
 
 echo "== setup: throwaway keys, user-mode sshd with StreamLocalBindUnlink =="
 ssh-keygen -q -t ed25519 -N '' -f "$T/hostkey"
@@ -48,13 +52,11 @@ StreamLocalBindUnlink yes
 PidFile $T/sshd.pid
 EOF
 
-"$SSHD" -f "$T/sshd_config" -E "$T/sshd.log" -D &
-PIDS+=($!)
-for _ in $(seq 1 50); do nc -z 127.0.0.1 2222 && break; sleep 0.1; done
+start_sshd
 
 # ssh reads ~/.ssh/config from the passwd entry, not $HOME, so a wrapper
-# earlier in PATH injects -F. This also covers the daemon's own tunnel
-# spawns, which inherit PATH.
+# earlier in PATH injects -F. This also covers the daemon's own ssh
+# spawns (supervisor + tunnel children), which inherit PATH.
 mkdir -p "$T/bin"
 cat > "$T/bin/ssh" <<EOF
 #!/bin/sh
@@ -62,8 +64,10 @@ exec "$(command -v ssh)" -F "$T/.ssh/config" "\$@"
 EOF
 chmod +x "$T/bin/ssh"
 
-# ssh alias: in production this is home-manager's matchBlocks + the
-# per-host RemoteForward. Here it's one throwaway stanza.
+# ssh alias: in production this is home-manager's matchBlocks. Here it's
+# one throwaway stanza. The daemon's supervisor overrides ControlMaster,
+# ControlPath, and ControlPersist with its own -M/-S/-o flags; these
+# settings are for interactive sessions only.
 mkdir -p "$T/.ssh"
 cat > "$T/.ssh/config" <<EOF
 Host remote1
@@ -74,8 +78,6 @@ Host remote1
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR
-    # Production parity: the home-manager module multiplexes sessions
-    # so the daemon can add forwards with ssh -O forward on the master.
     ControlMaster auto
     ControlPath $T/.porthole.d/control/%n
     ControlPersist 60m
@@ -103,17 +105,24 @@ export HOME=$T
 export PORTHOLE_OPENER="$T/opener.sh"
 export PATH="$T/bin:$PATH"
 
-echo "== start daemon (plays the macOS side) =="
+echo "== start daemon (plays the macOS side; supervisor owns the SSH master) =="
 ./target/debug/porthole daemon remote1 2>"$T/daemon.log" &
 PIDS+=($!)
-sleep 0.5
-
-echo "== attach: the RemoteForward session (production: mac -> remote) =="
-echo "   (ControlMaster daemonizes the -N session; teardown is ssh -O exit) =="
-ssh -N -R "$T/.porthole.sock:$T/.porthole.d/remote1.sock" remote1 &
-for _ in $(seq 1 50); do [ -S "$T/.porthole.sock" ] && break; sleep 0.1; done
-[ -S "$T/.porthole.sock" ] || { echo "FAIL: forwarded socket never appeared"; cat "$T/sshd.log"; exit 1; }
-echo "   forwarded socket is live"
+# The supervisor connects to the sshd and creates the RemoteForward.
+# Wait for the forwarded socket to appear on the "remote" side.
+ok=""
+for _ in $(seq 1 50); do [ -S "$T/.porthole.sock" ] && ok=1 && break; sleep 0.1; done
+[ -n "$ok" ] || { echo "FAIL: supervisor's RemoteForward socket never appeared"; cat "$T/daemon.log"; cat "$T/sshd.log"; exit 1; }
+# Probe until the socket actually accepts (file presence ≠ readiness).
+ok=""
+for _ in $(seq 1 20); do
+    if python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$T/.porthole.sock" 2>/dev/null; then
+        ok=1; break
+    fi
+    sleep 0.2
+done
+[ -n "$ok" ] || { echo "FAIL: forwarded socket appeared but never accepted"; cat "$T/daemon.log"; cat "$T/sshd.log"; exit 1; }
+echo "   forwarded socket is live (supervisor master connected)"
 
 echo "== 1. direct URL through the real RemoteForward =="
 ./target/debug/porthole open https://e2e.example.com
@@ -126,20 +135,32 @@ echo "    remote and local share 127.0.0.1, so the probe is right to fire) =="
 sleep 0.5
 echo "==   service sanity check: $(curl -s http://localhost:8888/) =="
 
-echo "== 3. drop the session: client spools =="
-ssh -O exit remote1
-# Wait for sshd to tear down the dead session's forward. Racing this is
-# how you connect to a stale socket file.
-for _ in $(seq 1 30); do [ ! -S "$T/.porthole.sock" ] && break; sleep 0.1; done
+echo "== 3. kill sshd: supervisor's master dies, client spools =="
+# Kill the sshd's child processes FIRST (while they're still parented
+# to the sshd), then the parent. If the parent dies first, the
+# children are reparented to init and pkill -P can't find them — the
+# TCP connection stays alive and the ssh client never exits.
+pkill -P "$SSHD_PID" 2>/dev/null || true
+kill "$SSHD_PID" 2>/dev/null || true
+# Give the ssh client time to detect the closed TCP connection and
+# exit. The supervisor will then detect the exit and start backoff.
+sleep 1
+# Force-remove the forwarded socket to simulate the connection being
+# fully gone (sshd may leave the file behind on abrupt exit).
+rm -f "$T/.porthole.sock"
 ./target/debug/porthole open https://spooled.example.com
-echo "   spool contents: $(cat "$T/.porthole.spool")"
+echo "   spool contents: $(cat "$T/.porthole.spool" 2>/dev/null || echo '(empty)')"
+grep -q 'spooled.example.com' "$T/.porthole.spool" 2>/dev/null || { echo "FAIL: URL was not spooled"; exit 1; }
+echo "   URL spooled successfully"
 
-echo "== 4. re-attach (StreamLocalBindUnlink replaces the stale socket) =="
-ssh -N -R "$T/.porthole.sock:$T/.porthole.d/remote1.sock" remote1 2>"$T/reattach.log" &
+echo "== 4. restart sshd: supervisor reconnects, spool flushes =="
+start_sshd
+# Wait for the supervisor to reconnect (backoff is 1-2s) and the
+# forwarded socket to reappear.
 ok=""
 for _ in $(seq 1 50); do [ -S "$T/.porthole.sock" ] && ok=1 && break; sleep 0.1; done
-[ -n "$ok" ] || { echo "FAIL: re-attach"; cat "$T/reattach.log"; exit 1; }
-# Presence is not readiness: probe until the new socket accepts.
+[ -n "$ok" ] || { echo "FAIL: supervisor did not reconnect after sshd restart"; cat "$T/daemon.log"; cat "$T/sshd.log"; exit 1; }
+# Probe until the new socket accepts.
 ok=""
 for _ in $(seq 1 20); do
     if python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$T/.porthole.sock" 2>/dev/null; then
@@ -148,15 +169,18 @@ for _ in $(seq 1 20); do
     sleep 0.2
 done
 [ -n "$ok" ] || { echo "FAIL: re-attached socket never accepted"; exit 1; }
+echo "   supervisor reconnected, forwarded socket live"
 ./target/debug/porthole open https://flush.example.com
 sleep 0.5
+[ ! -f "$T/.porthole.spool" ] || { echo "FAIL: spool was not flushed after reconnect"; exit 1; }
+echo "   spool flushed successfully"
 
-echo "== 5. oauth-style URL: sniffed callback port forwarded via the control socket =="
+echo "== 5. oauth-style URL: sniffed callback port forwarded via the supervisor's master =="
 ./target/debug/porthole open 'https://login.example.com/oauth2/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A8899%2Fcallback&state=y'
 ok=""
 for _ in $(seq 1 30); do nc -z 127.0.0.1 8899 && ok=1 && break; sleep 0.2; done
 [ -n "$ok" ] || { echo "FAIL: sniffed callback port never forwarded"; cat "$T/daemon.log"; exit 1; }
-echo "   callback port 8899 accepts (mux forward live on the real ssh master)"
+echo "   callback port 8899 accepts (mux forward on the supervisor's master)"
 
 echo "== 6. status sees the mux forward (lsof on the master pid) =="
 ./target/debug/porthole status | tee "$T/status.out"

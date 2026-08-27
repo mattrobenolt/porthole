@@ -26,6 +26,7 @@ use std::io;
 use std::mem;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -279,19 +280,39 @@ impl Registry {
     }
 }
 
-/// The ssh control socket directory: one socket per host, named by the
-/// alias (`ControlPath ~/.porthole.d/control/%n` in the generated ssh
-/// config), so host → socket is a path join, not a lookup table.
+/// The ssh control socket directory: one socket per host, owned by
+/// the connection supervisor (`~/.porthole.d/master/<host>`). This is
+/// separate from the user's interactive-session ControlPath
+/// (`~/.porthole.d/control/%n`), so herdr, Zed, and terminal sessions
+/// keep their own multiplexing without interference.
 pub fn control_dir() -> Option<PathBuf> {
-    env::home_dir().map(|home| home.join(".porthole.d").join("control"))
+    env::home_dir().map(|home| home.join(".porthole.d").join("master"))
 }
 
-/// The host's control socket, only when it is a live-shaped socket
-/// file. A stale or absent file falls through to the child path.
+/// The host's control socket, only when it is a live master. A socket
+/// file that exists but nobody is listening on (stale master from a
+/// dead connection) is unlinked so it never clogs the mux path or child
+/// tunnels with "ControlSocket already exists, disabling multiplexing."
 fn control_socket_for(host: &str) -> Option<PathBuf> {
     let path = control_dir()?.join(host);
     match fs::metadata(&path) {
-        Ok(meta) if meta.file_type().is_socket() => Some(path),
+        Ok(meta) if meta.file_type().is_socket() => {
+            // A socket file exists, but the master might be dead. A
+            // stale file makes every mux forward fail (the round trip
+            // to the dead master times out) and blocks child tunnels
+            // from creating a new master. Probe with a connect:
+            // ConnectionRefused means nobody is listening.
+            if StdUnixStream::connect(&path).is_ok() {
+                Some(path)
+            } else {
+                eprintln!(
+                    "porthole daemon: {host}: stale control socket {}, removing",
+                    path.display()
+                );
+                let _ = fs::remove_file(&path);
+                None
+            }
+        }
         _ => None,
     }
 }

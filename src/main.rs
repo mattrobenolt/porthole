@@ -16,6 +16,8 @@ use std::process::ExitCode;
 use url::Url;
 
 #[cfg(feature = "daemon")]
+mod connection;
+#[cfg(feature = "daemon")]
 mod daemon;
 #[cfg(feature = "daemon")]
 mod tunnel;

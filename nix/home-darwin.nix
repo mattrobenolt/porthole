@@ -6,8 +6,12 @@ self:
   ...
 }:
 # home-manager module for the macOS local host: runs the daemon under
-# launchd and declares one ssh RemoteForward per managed host, from the
-# same attrset — one edit wires both halves of the contract.
+# launchd and sets up ssh multiplexing for interactive sessions. The
+# daemon owns its own persistent SSH master connections (one per host)
+# that carry the RemoteForward and serve as control sockets for tunnel
+# forwards; the ssh settings here are purely for the user's interactive
+# sessions (terminals, herdr, Zed) and do not carry a RemoteForward —
+# that would clobber the daemon's master on the remote socket.
 let
   cfg = config.programs.porthole;
   home = config.home.homeDirectory;
@@ -32,9 +36,9 @@ in
       ];
       description = ''
         Remote hosts porthole accepts URLs from. The daemon binds one
-        socket per host under ~/.porthole.d/, and one ssh matchBlock
-        RemoteForward is generated per host. The names must match the
-        Host aliases in your ssh config.
+        socket per host under ~/.porthole.d/, and spawns one persistent
+        SSH master per host carrying the RemoteForward. The names must
+        match the Host aliases in your ssh config.
       '';
     };
   };
@@ -57,29 +61,26 @@ in
       };
     };
 
-    # One RemoteForward per host: the remote's ~/.porthole.sock lands on
-    # the daemon's per-host socket here. Address-only entries render as
-    # unix socket paths (home-manager asserts paths carry no port).
+    # SSH multiplexing for interactive sessions (terminals, herdr,
+    # Zed). The daemon maintains its own masters on
+    # ~/.porthole.d/master/<host>; these settings are for the user's
+    # convenience only and do not carry a RemoteForward — the daemon's
+    # master owns that, and an interactive-session RemoteForward would
+    # clobber it on the remote (StreamLocalBindUnlink replaces the
+    # socket on each new connection).
     # programs.ssh.settings — matchBlocks is a deprecated alias.
-    programs.ssh.settings = lib.genAttrs cfg.hosts (host: {
+    programs.ssh.settings = lib.genAttrs cfg.hosts (_host: {
       # Reap half-dead attach sessions fast: a stale forward otherwise
       # accepts client writes into a dead channel, silently.
       ServerAliveInterval = 15;
       ServerAliveCountMax = 2;
-      # Multiplex every session to a porthole host over one connection.
-      # The daemon then creates tunnels as `ssh -O forward` round trips
-      # on the live master instead of spawning one ssh process per port.
-      # %n is the alias as typed, which is exactly the host name the
-      # daemon learns from its socket file — no mapping table.
+      # Multiplex every interactive session to a porthole host over one
+      # connection. The user's ControlPath is separate from the
+      # daemon's master socket (~/.porthole.d/master/), so the two do
+      # not interfere.
       ControlMaster = "auto";
       ControlPath = "${home}/.porthole.d/control/%n";
       ControlPersist = "60m";
-      RemoteForward = [
-        {
-          bind.address = "${home}/.porthole.sock";
-          host.address = "${home}/.porthole.d/${host}.sock";
-        }
-      ];
     });
   };
 }

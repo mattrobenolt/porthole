@@ -18,13 +18,15 @@ redirect back to localhost lands on a live tunnel.
 
 - One binary serves every role: client, daemon, and admin tool.
 - The remote runs no daemon. The client writes one JSON line to a Unix socket.
-- SSH carries the socket through a `RemoteForward` from your Mac.
+- The daemon owns a persistent SSH master per host (via launchd): it carries the
+  `RemoteForward` for request delivery and serves as the control socket for
+  tunnel forwards. When the connection dies (laptop sleep, network loss), the
+  supervisor auto-reconnects with backoff.
 - The daemon on macOS validates the URL, manages tunnels, and calls `open(1)`.
-- Tunnels ride the session's own multiplexed SSH connection: the home-manager
-  module sets `ControlMaster auto` and `ControlPath ~/.porthole.d/control/%n`
-  per host, so a tunnel is one `ssh -O forward` round trip — no extra ssh
-  processes, and forwards die with the connection. Sessions without a control
-  socket get a spawned `ssh -N -L` instead.
+- Tunnels ride the supervisor's multiplexed SSH connection: a tunnel is one
+  `ssh -O forward` round trip on the master's control socket — no extra ssh
+  processes, and forwards die with the connection. When the master is down
+  (reconnecting), a spawned `ssh -N -L` child provides the forward instead.
 - If no SSH session is up, the client spools the URL to disk. The next
   successful call flushes the spool, oldest first.
 
@@ -45,8 +47,10 @@ programs.porthole = {
 };
 ```
 
-The module runs the daemon under launchd and declares one ssh `RemoteForward`
-per host.
+The module runs the daemon under launchd. The daemon owns its SSH master
+connections — you no longer need an interactive SSH session for porthole to
+work. Your existing `ssh`, `herdr --remote`, and Zed sessions are unaffected
+(they keep their own multiplexing).
 
 ### The remote side (NixOS home-manager)
 
