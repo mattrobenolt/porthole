@@ -6,7 +6,9 @@
 # Two hosts on one daemon exercise the first-tunnel-wins conflict
 # policy. The supervisor starts a master for testhost (stub creates
 # the control socket → mux path); for otherhost the stub simulates
-# spawn failure → child fallback path.
+# spawn failure → child fallback path. The callback reaper runs at
+# 200x speed (PORTHOLE_REAP_SCALE) and its two teardown paths —
+# quiet-after-use and abandoned-flow — are asserted at the end.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -109,7 +111,11 @@ while True:
         exit 0
         ;;
     cancel)
-        # -O cancel -L <port>: cancel a forward (no-op for the stub).
+        # -O cancel -L <port>: tear down the nc standing in for the
+        # mux forward, like a real master releasing its listener.
+        [ -n "$spec" ] || exit 0
+        port="${spec%%:*}"
+        pkill -f "nc -k -l 127.0.0.1 $port" 2>/dev/null || true
         exit 0
         ;;
     *)
@@ -129,6 +135,9 @@ export HOME=$T
 export PORTHOLE_OPENER="$T/opener.sh"
 export PATH="$T/bin:$PATH"
 export STUB_SSH_FAIL=3999
+# Run the callback reaper 200x faster so reaping is assertable in
+# seconds: poll 0.15s, quiet-after-use 1.5s, unused 9s.
+export PORTHOLE_REAP_SCALE=0.005
 
 echo "== start daemon with two hosts =="
 ./target/debug/porthole daemon testhost otherhost 2>"$T/daemon.log" &
@@ -187,7 +196,45 @@ echo "== 8.5 tunnel subcommand =="
 rc=0; ./target/debug/porthole tunnel kill 3999 || rc=$?; echo "kill-missing exit=$rc"
 rc=0; ./target/debug/porthole tunnel frobnicate || rc=$?; echo "unknown exit=$rc"
 
-echo "== 9. SIGTERM: sockets removed, child tunnels killed =="
+echo "== 9. callback reaping: a connection rode the forward, then quiet =="
+ln -sf "$T/.porthole.d/testhost.sock" "$T/.porthole.sock"
+./target/debug/porthole open 'https://login.example.com/oauth2/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A3200%2Fcb'
+sleep 0.3
+nc -z 127.0.0.1 3200 || { echo "FAIL: callback port 3200 not forwarded"; exit 1; }
+# Simulate the redirect: hold a real connection through the forward
+# long enough for the reaper to see it (-d: no stdin, pure hold).
+nc -d 127.0.0.1 3200 >/dev/null 2>&1 &
+NCPID=$!
+sleep 0.7
+kill "$NCPID" 2>/dev/null || true
+# Quiet window (1.5s at this scale) plus margin.
+sleep 4
+nc -z 127.0.0.1 3200 && { echo "FAIL: sniffed port 3200 still listening after quiet reap"; exit 1; }
+grep -q "reaped callback tunnel on port 3200" "$T/daemon.log" || { echo "FAIL: no reap line in daemon log"; cat "$T/daemon.log"; exit 1; }
+echo "   callback forward reaped after use"
+
+echo "== 10. callback reaping: flow never lands (abandoned) =="
+./target/debug/porthole open 'https://login.example.com/oauth2/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A3300%2Fcb'
+sleep 0.3
+nc -z 127.0.0.1 3300 || { echo "FAIL: callback port 3300 not forwarded"; exit 1; }
+# No connection ever held: the unused timer (9s at this scale) reaps.
+sleep 11
+nc -z 127.0.0.1 3300 && { echo "FAIL: abandoned callback port 3300 still listening"; exit 1; }
+grep -q "reaped callback tunnel on port 3300" "$T/daemon.log" || { echo "FAIL: no reap line for 3300"; cat "$T/daemon.log"; exit 1; }
+echo "   abandoned callback forward reaped"
+
+# Same abandonment through the child mechanism: otherhost has no
+# master, so the sniff falls back to a spawned ssh -N -L.
+ln -sf "$T/.porthole.d/otherhost.sock" "$T/.porthole.sock"
+./target/debug/porthole open 'https://login.example.com/oauth2/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A3400%2Fcb'
+sleep 0.3
+nc -z 127.0.0.1 3400 || { echo "FAIL: callback port 3400 not forwarded (child)"; exit 1; }
+sleep 11
+nc -z 127.0.0.1 3400 && { echo "FAIL: abandoned child callback port 3400 still listening"; exit 1; }
+grep -q "reaped callback tunnel on port 3400" "$T/daemon.log" || { echo "FAIL: no reap line for 3400 (child)"; cat "$T/daemon.log"; exit 1; }
+echo "   abandoned callback forward reaped (child path)"
+
+echo "== 11. SIGTERM: sockets removed, child tunnels killed =="
 kill -TERM "$DPID"
 DPID=""
 sleep 0.7
@@ -198,9 +245,10 @@ if pgrep -f "nc -k -l 127.0.0.1 3001" >/dev/null; then
     exit 1
 fi
 echo "   child tunnel gone"
-# Mux forwards (3000, 3100) intentionally survive daemon shutdown: they
-# belong to the ssh connection, not the daemon. The stub's nc stand-ins
-# are reaped by the trap.
+# Dev mux forwards (3000) intentionally survive daemon shutdown: they
+# belong to the ssh connection, not the daemon. The sniffed callback
+# forwards (3100 and friends) were already reaped by the callback
+# reaper mid-test. The stub's nc stand-ins are reaped by the trap.
 
 echo "== opened.log (expect: 3000, 3000/path2, 4000, authorize URL, 3001 — nothing else) =="
 cat "$T/opened.log"

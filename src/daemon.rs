@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::Request;
 use crate::connection::Supervisor;
-use crate::tunnel::{self, Ensure, Registry};
+use crate::tunnel::{self, Ensure, Purpose, Registry};
 
 /// Entry point for `porthole daemon <host>...`.
 ///
@@ -76,6 +76,11 @@ async fn serve(hosts: Vec<String>) -> io::Result<()> {
     // externally-managed SSH sessions.
     let supervisor = Supervisor::new();
     supervisor.start(hosts.clone());
+
+    // Callback forwards get a lifecycle: reaped once their one redirect
+    // has ridden them (or the flow is abandoned), so a fixed callback
+    // port is never squatted for days.
+    registry.spawn_reaper();
 
     let mut paths = Vec::new();
     let mut tasks = Vec::new();
@@ -245,7 +250,7 @@ async fn handle_open(host: &str, url: &str, registry: &Registry) {
     // ever asking us. This is the only chance to tunnel it. Best-effort:
     // a failure here must not keep the authorize page from loading.
     for port in sniff_callback_ports(url) {
-        match registry.ensure(host, port).await {
+        match registry.ensure(host, port, Purpose::Sniff).await {
             Ok(Ensure::Started) => {
                 eprintln!("porthole daemon: {host}: pre-tunneled callback port {port}")
             }
@@ -262,7 +267,7 @@ async fn handle_open(host: &str, url: &str, registry: &Registry) {
     }
     match classify(url) {
         Ok(Target::Direct) => open_and_log(host, url).await,
-        Ok(Target::Tunnel(port)) => match registry.ensure(host, port).await {
+        Ok(Target::Tunnel(port)) => match registry.ensure(host, port, Purpose::Dev).await {
             Ok(Ensure::Ready) | Ok(Ensure::Started) => {
                 if tunnel::wait_ready(port).await {
                     open_and_log(host, url).await;

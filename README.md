@@ -27,6 +27,10 @@ redirect back to localhost lands on a live tunnel.
   `ssh -O forward` round trip on the master's control socket — no extra ssh
   processes, and forwards die with the connection. When the master is down
   (reconnecting), a spawned `ssh -N -L` child provides the forward instead.
+- OAuth callback tunnels don't linger. The reaper watches them with lsof
+  and tears one down once the flow's redirect has ridden it and gone quiet
+  (or the flow never lands at all), so a fixed callback port — AWS SSO's is
+  fixed — is never squatted for days, blocking local tools from binding it.
 - If no SSH session is up, the client spools the URL to disk. The next
   successful call flushes the spool, oldest first.
 
