@@ -4,6 +4,7 @@
 //! mapping tables. The ssh RemoteForward on each remote points at the
 //! matching `~/.porthole.d/<host>.sock` on this machine.
 
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::io;
@@ -21,9 +22,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
 use url::Url;
 
-use crate::Request;
 use crate::connection::Supervisor;
 use crate::tunnel::{self, Ensure, Purpose, Registry};
+use crate::{CLIPBOARD_MAX, Request, Response};
 
 /// Entry point for `porthole daemon <host>...`.
 ///
@@ -220,7 +221,7 @@ async fn handle_conn(stream: UnixStream, host: String, registry: Registry) {
                     );
                     return;
                 }
-                handle_line(&host, content, &registry).await;
+                handle_line(&host, content, &registry, &mut reader).await;
             }
             Err(e) => {
                 eprintln!("porthole daemon: {host}: read error: {e}");
@@ -230,7 +231,12 @@ async fn handle_conn(stream: UnixStream, host: String, registry: Registry) {
     }
 }
 
-async fn handle_line(host: &str, line: &str, registry: &Registry) {
+async fn handle_line(
+    host: &str,
+    line: &str,
+    registry: &Registry,
+    writer: &mut BufReader<UnixStream>,
+) {
     let request = match serde_json::from_str::<Request>(line) {
         Ok(r) => r,
         Err(e) => {
@@ -241,6 +247,46 @@ async fn handle_line(host: &str, line: &str, registry: &Registry) {
     match request {
         Request::Open { url } => handle_open(host, &url, registry).await,
         Request::Clipboard { clipboard } => set_clipboard(host, &clipboard).await,
+        // The only request that gets a reply. The writer rides along
+        // for this arm alone; every write request stays fire-and-forget.
+        Request::Paste { .. } => reply_paste(host, writer).await,
+    }
+}
+
+/// The paste direction: read this Mac's clipboard, send it back on the
+/// same connection as exactly one line — success or error — so a
+/// waiting client never hangs on silence. A dead connection is the
+/// client's problem; its read timeout owns that side.
+async fn reply_paste(host: &str, writer: &mut BufReader<UnixStream>) {
+    let response = read_clipboard(host).await;
+    let mut line = match serde_json::to_string(&response) {
+        Ok(l) => l,
+        Err(e) => {
+            // Serializing plain strings cannot fail, but stay loud
+            // rather than reply nothing.
+            eprintln!("porthole daemon: {host}: serializing paste reply: {e}");
+            return;
+        }
+    };
+    // A 32 KiB clipboard of control characters escapes to six times
+    // that in JSON. The client reads one bounded line, so the reply
+    // must keep that bargain or refuse the paste outright.
+    if line.len() > MAX_LINE {
+        eprintln!(
+            "porthole daemon: {host}: paste reply of {} bytes exceeds the {}-byte line, refusing",
+            line.len(),
+            MAX_LINE
+        );
+        line = r#"{"error":"clipboard too large for the wire line"}"#.to_string();
+    }
+    line.push('\n');
+    let stream = writer.get_mut();
+    if let Err(e) = stream.write_all(line.as_bytes()).await {
+        eprintln!("porthole daemon: {host}: writing paste reply: {e}");
+        return;
+    }
+    if let Err(e) = stream.flush().await {
+        eprintln!("porthole daemon: {host}: flushing paste reply: {e}");
     }
 }
 
@@ -295,6 +341,73 @@ async fn handle_open(host: &str, url: &str, registry: &Registry) {
         Err(reason) => {
             eprintln!("porthole daemon: {host}: rejected {url}: {reason}");
         }
+    }
+}
+
+/// PORTHOLE_PBPASTE is the read-path twin of the PORTHOLE_PBCOPY seam:
+/// /usr/bin/pbpaste in production, a stub under test.
+async fn read_clipboard(host: &str) -> Response<'static> {
+    let tool = env::var("PORTHOLE_PBPASTE").unwrap_or_else(|_| "/usr/bin/pbpaste".to_string());
+    let spawned = Command::new(tool)
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => return paste_error(format!("clipboard tool failed to spawn: {e}")),
+    };
+
+    // One byte past the cap: the paste-versus-refuse decision needs
+    // to see the overage, not just the cap.
+    let mut bytes = Vec::new();
+    let mut read_err = None;
+    if let Some(out) = child.stdout.take()
+        && let Err(e) = out
+            .take(CLIPBOARD_MAX as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+    {
+        read_err = Some(e);
+    }
+    // Past the cap the tool may still be writing into a full pipe;
+    // kill before waiting, or wait() blocks behind it forever.
+    let over = bytes.len() > CLIPBOARD_MAX;
+    if over || read_err.is_some() {
+        let _ = child.start_kill();
+    }
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => return paste_error(format!("waiting for clipboard tool: {e}")),
+    };
+    if let Some(e) = read_err {
+        return paste_error(format!("reading clipboard tool output: {e}"));
+    }
+    if over {
+        eprintln!(
+            "porthole daemon: {host}: clipboard exceeds {CLIPBOARD_MAX} bytes, refusing to paste"
+        );
+        return paste_error(format!("clipboard exceeds {CLIPBOARD_MAX} bytes"));
+    }
+    if !status.success() {
+        return paste_error(format!("clipboard tool exited with {status}"));
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => {
+            eprintln!(
+                "porthole daemon: {host}: clipboard read for paste ({} bytes)",
+                text.len()
+            );
+            Response::Clipboard {
+                clipboard: Cow::Owned(text),
+            }
+        }
+        Err(_) => paste_error("clipboard is not valid UTF-8 (text pastes only)".to_string()),
+    }
+}
+
+fn paste_error(reason: String) -> Response<'static> {
+    Response::Error {
+        error: Cow::Owned(reason),
     }
 }
 

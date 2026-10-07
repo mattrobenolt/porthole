@@ -1,17 +1,18 @@
 //! porthole — open URLs from remote machines in the local browser.
-//! One binary, six roles: daemon, open, herdr-open, clipboard, status, tunnel.
-//! Symlinks named `open`, `pbcopy`, or `lemonade` dispatch to the
-//! client, busybox-style.
+//! One binary, seven roles: daemon, open, herdr-open, clipboard, paste,
+//! status, tunnel. Symlinks named `open`, `pbcopy`, `pbpaste`, or
+//! `lemonade` dispatch to the client, busybox-style.
 
 use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::iter::once;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use url::Url;
 
@@ -33,6 +34,7 @@ commands:
   daemon     run the local daemon (owned by launchd)
   herdr-open open a URL from a herdr link handler (reads HERDR_PLUGIN_CLICKED_URL)
   open       send a URL to the daemon, spool it if unreachable
+  paste      print the local clipboard to stdout (also: pbpaste)
   status     show daemon and tunnel state
   tunnel     inspect or kill tunnels
 
@@ -47,6 +49,7 @@ usage:
   porthole open <url>         send a URL to the local browser
   porthole herdr-open <url>   open a URL from a herdr link handler
   porthole clipboard          set the local clipboard from stdin
+  porthole paste              print the local clipboard to stdout
 
 This build carries the remote client only. The daemon, status, and
 tunnel roles exist in the macOS build.
@@ -63,13 +66,14 @@ fn main() -> ExitCode {
         })
         .unwrap_or_default();
 
-    // Multicall: the nix module symlinks `open`, `pbcopy`, and
-    // `lemonade` to this binary on remotes, so macOS-style callers,
-    // $BROWSER, and Neovim's clipboard probe work without wrapper
-    // scripts.
+    // Multicall: the nix module symlinks `open`, `pbcopy`, `pbpaste`,
+    // and `lemonade` to this binary on remotes, so macOS-style callers,
+    // $BROWSER, both clipboard directions, and Neovim's clipboard
+    // probe work without wrapper scripts.
     match invoked_as.as_str() {
         "open" => return open(args),
         "pbcopy" => return clipboard(args),
+        "pbpaste" => return paste(args),
         "lemonade" => return lemonade(args),
         _ => {}
     }
@@ -82,6 +86,7 @@ fn main() -> ExitCode {
     match command.as_str() {
         "open" => open(args),
         "clipboard" => clipboard(args),
+        "paste" => paste(args),
         "herdr-open" => herdr_open(args),
         #[cfg(feature = "daemon")]
         "daemon" => daemon::run(args),
@@ -115,6 +120,27 @@ enum Request<'a> {
     Clipboard {
         #[serde(borrow)]
         clipboard: Cow<'a, str>,
+    },
+    Paste {
+        paste: bool,
+    },
+}
+
+/// The daemon's reply, one JSON line on the same connection, for the
+/// requests that need one. Paste is the only such request today; the
+/// write requests (Open, Clipboard) stay fire-and-forget with no ack.
+/// Success carries the clipboard; failure carries a reason, so the
+/// client fails fast on the daemon's own terms instead of timing out.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum Response<'a> {
+    Clipboard {
+        #[serde(borrow)]
+        clipboard: Cow<'a, str>,
+    },
+    Error {
+        #[serde(borrow)]
+        error: Cow<'a, str>,
     },
 }
 
@@ -233,10 +259,11 @@ fn write_request(w: &mut impl Write, request: &Request) -> io::Result<()> {
     writeln!(w, "{line}")
 }
 
-/// Largest clipboard payload, raw bytes. JSON escaping inflates the wire
-/// line (the daemon caps lines at 64 KiB) and terminals cap OSC 52
-/// payloads too, so text pastes only — this is a clipboard, not a pipe.
-const CLIPBOARD_MAX: usize = 32 * 1024;
+/// Largest clipboard payload, raw bytes, both directions. JSON escaping
+/// inflates the wire line (the daemon caps lines at 64 KiB) and terminals
+/// cap OSC 52 payloads too, so text pastes only — this is a clipboard,
+/// not a pipe. Visible to the daemon module for its side of the cap.
+pub(crate) const CLIPBOARD_MAX: usize = 32 * 1024;
 
 /// `porthole clipboard` (also reachable as `pbcopy`): stdin → the local
 /// clipboard.
@@ -308,24 +335,117 @@ fn clipboard(_args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+/// `porthole paste` (also reachable as `pbpaste`): the Mac's
+/// clipboard → stdout. The read direction of the bridge.
+///
+/// There is no OSC 52 shortcut here: terminals almost universally
+/// refuse the query form of the sequence (it would let any program
+/// silently read the clipboard), so attached or detached, the request
+/// rides the daemon socket and the reply rides the same connection.
+///
+/// A read has nothing to spool, and never blocks forever: a reply that
+/// never lands times out, so an editor calling this as a clipboard
+/// provider fails loudly instead of hanging its UI.
+fn paste(_args: impl Iterator<Item = String>) -> ExitCode {
+    let Some(home) = env::home_dir() else {
+        eprintln!("porthole paste: cannot determine home directory");
+        return ExitCode::FAILURE;
+    };
+    let sock = home.join(".porthole.sock");
+    let spool = home.join(".porthole.spool");
+    match paste_inner(&sock, &spool) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("porthole paste: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Paste has no tty branch, so it lives beside `open_inner`, not inside
+/// `clipboard`: connect, opportunistically flush the URL spool (the
+/// transport is up), ask, and read one line back. The daemon acks
+/// nothing but Paste, so the first line back is the paste reply.
+fn paste_inner(sock: &Path, spool: &Path) -> io::Result<()> {
+    let mut stream = UnixStream::connect(sock).map_err(|e| {
+        if unreachable(&e) {
+            io::Error::other("daemon unreachable (paste needs a live connection)")
+        } else {
+            e
+        }
+    })?;
+    stream.set_read_timeout(Some(PASTE_TIMEOUT))?;
+    stream.set_write_timeout(Some(PASTE_TIMEOUT))?;
+
+    flush_spool(&mut stream, spool)?;
+    write_request(&mut stream, &Request::Paste { paste: true })?;
+
+    // One bounded line back. The daemon enforces the same cap on its
+    // replies as on its reads, so a longer line means the protocol
+    // broke, not that patience should increase.
+    let mut line = String::new();
+    let n = match io::BufReader::new(&mut stream)
+        .take(MAX_REPLY_LINE as u64 + 1)
+        .read_line(&mut line)
+    {
+        Ok(n) => n,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            return Err(io::Error::other(format!(
+                "no reply within {} s (busy daemon, or one built before the paste bridge)",
+                PASTE_TIMEOUT.as_secs()
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    if n == 0 {
+        return Err(io::Error::other(
+            "daemon closed the connection without replying (old daemon without paste support?)",
+        ));
+    }
+    if line.len() > MAX_REPLY_LINE {
+        return Err(io::Error::other(format!(
+            "reply exceeds {MAX_REPLY_LINE} bytes"
+        )));
+    }
+
+    match serde_json::from_str::<Response>(line.trim_end()) {
+        Ok(Response::Clipboard { clipboard }) => {
+            io::stdout().write_all(clipboard.as_bytes())?;
+            io::stdout().flush()?;
+            Ok(())
+        }
+        Ok(Response::Error { error }) => Err(io::Error::other(error.into_owned())),
+        Err(e) => Err(io::Error::other(format!(
+            "malformed reply from daemon: {e}"
+        ))),
+    }
+}
+
+/// How long `porthole paste` waits for the daemon's reply. Generous
+/// against one SSH round trip plus pbpaste; short enough that an
+/// editor calling this as a provider recovers before the user notices.
+const PASTE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The largest reply line the client accepts, mirroring the daemon's
+/// inbound line cap. (Not imported from daemon.rs: that module is
+/// feature-gated off in the remote build, and the client must enforce
+/// the cap in that build too.)
+const MAX_REPLY_LINE: usize = 64 * 1024;
+
 /// `lemonade` impersonation: of every clipboard provider Neovim probes
 /// for, this is the only one with no environment gate — no has('mac'),
 /// no $DISPLAY, no $WAYLAND_DISPLAY, just `executable('lemonade')`.
 /// Under this name the bridge is auto-detected on any remote, SSH
 /// sessions included, with zero editor configuration.
 ///
-/// The dialect is two subcommands. `copy` is the clipboard role.
-/// `paste` would need a read path on the daemon that does not exist
-/// yet; fail loudly rather than silently paste nothing.
+/// The dialect is two subcommands: `copy` is the clipboard role,
+/// `paste` is the paste role (the Mac's clipboard on stdout).
 fn lemonade(mut args: impl Iterator<Item = String>) -> ExitCode {
     match args.next().as_deref() {
         Some("copy") => clipboard(args),
-        Some("paste") => {
-            eprintln!("porthole lemonade: paste is not implemented (the bridge is one-way)");
-            ExitCode::FAILURE
-        }
+        Some("paste") => paste(args),
         _ => {
-            eprintln!("usage: lemonade copy");
+            eprintln!("usage: lemonade copy|paste");
             ExitCode::from(2)
         }
     }
@@ -384,5 +504,25 @@ mod tests {
             panic!("expected Clipboard");
         };
         assert_eq!(clipboard, "hello");
+
+        let paste: Request = serde_json::from_str(r#"{"paste":true}"#).unwrap();
+        assert!(matches!(paste, Request::Paste { paste: true }));
+        let wire = serde_json::to_string(&Request::Paste { paste: true }).unwrap();
+        assert_eq!(wire, r#"{"paste":true}"#);
+    }
+
+    #[test]
+    fn reply_format_both_verbs() {
+        let ok: Response = serde_json::from_str(r#"{"clipboard":"hello"}"#).unwrap();
+        let Response::Clipboard { clipboard } = ok else {
+            panic!("expected Clipboard reply");
+        };
+        assert_eq!(clipboard, "hello");
+
+        let err: Response = serde_json::from_str(r#"{"error":"boom"}"#).unwrap();
+        let Response::Error { error } = err else {
+            panic!("expected Error reply");
+        };
+        assert_eq!(error, "boom");
     }
 }

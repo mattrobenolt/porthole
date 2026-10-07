@@ -85,12 +85,14 @@
               + pkgs.lib.optionalString (!daemon) ''
                 # Busybox-style argv[0] dispatch makes these shims:
                 # `open` for macOS-style callers and $BROWSER, `pbcopy`
-                # for the clipboard bridge, `lemonade` so Neovim's
-                # clipboard probe — executable('lemonade') is the only
-                # one with no display-server gate — finds the bridge
-                # with zero editor configuration.
+                # and `pbpaste` for the clipboard bridge (both
+                # directions), `lemonade` so Neovim's clipboard probe
+                # — executable('lemonade') is the only one with no
+                # display-server gate — finds the bridge with zero
+                # editor configuration.
                 ln -s $out/bin/porthole $out/bin/open
                 ln -s $out/bin/porthole $out/bin/pbcopy
+                ln -s $out/bin/porthole $out/bin/pbpaste
                 ln -s $out/bin/porthole $out/bin/lemonade
               '';
               meta.mainProgram = "porthole";

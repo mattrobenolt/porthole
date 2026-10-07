@@ -27,9 +27,22 @@ cat > "$T/clipboard.txt"
 EOF
 chmod +x "$T/pbcopy.sh"
 
+# The pbpaste stand-in is mode-switchable by marker file: the daemon
+# reads PORTHOLE_PBPASTE from its own env at startup, so per-command
+# env overrides on the client would change nothing. One daemon, one
+# stub, three behaviors: normal, always-fail, always-oversized.
+cat > "$T/pbpaste.sh" <<EOF
+#!/bin/sh
+if [ -f "$T/pbpaste-fail" ]; then exit 3; fi
+if [ -f "$T/pbpaste-big" ]; then head -c 40000 /dev/zero | tr '\0' 'a'; exit 0; fi
+cat "$T/clipboard.txt" 2>/dev/null
+EOF
+chmod +x "$T/pbpaste.sh"
+
 export HOME=$T
 export PORTHOLE_OPENER="$T/opener.sh"
 export PORTHOLE_PBCOPY="$T/pbcopy.sh"
+export PORTHOLE_PBPASTE="$T/pbpaste.sh"
 
 echo "== start daemon for host 'testhost' =="
 ./target/debug/porthole daemon testhost 2>"$T/daemon.log" &
@@ -95,6 +108,7 @@ echo "--- clipboard capture:" && cat "$T/clipboard.txt"
 
 echo "== 7b. lemonade impersonation (Neovim's ungated probe) =="
 ln -s "$PWD/target/debug/porthole" "$T/lemonade"
+ln -s "$PWD/target/debug/porthole" "$T/pbpaste"
 # stdout redirected to a file: forces the detached path even when the
 # script itself runs on a tty.
 printf 'via lemonade' | "$T/lemonade" copy > "$T/lemonade.out"
@@ -104,15 +118,52 @@ if [ "$(cat "$T/clipboard.txt")" = "via lemonade" ]; then
 else
     echo "FAIL: lemonade copy did not reach the daemon"; exit 1
 fi
-rc=0; "$T/lemonade" paste >/dev/null 2>&1 || rc=$?
-[ "$rc" = 1 ] && echo "   lemonade paste fails loudly (exit=1)" || { echo "FAIL: paste exit=$rc"; exit 1; }
+# The paste round-trip: the same content back through the daemon's
+# reply path, via Neovim's probe name.
+round=$("$T/lemonade" paste 2>"$T/paste.err")
+if [ "$round" = "via lemonade" ]; then
+    echo "   lemonade paste round-tripped through the daemon"
+else
+    echo "FAIL: lemonade paste got '$round'"; cat "$T/paste.err"; exit 1
+fi
+round=$("$T/pbpaste" 2>>"$T/paste.err")
+if [ "$round" = "via lemonade" ]; then
+    echo "   pbpaste symlink round-tripped"
+else
+    echo "FAIL: pbpaste got '$round'"; cat "$T/paste.err"; exit 1
+fi
+# A failing clipboard tool surfaces the daemon's error reply, not a hang.
+touch "$T/pbpaste-fail"
+rc=0; "$T/pbpaste" >"$T/paste-fail.out" 2>"$T/paste-fail.err" || rc=$?
+if [ "$rc" = 1 ] && grep -q "exited" "$T/paste-fail.err"; then
+    echo "   failing pbpaste tool fails loudly with the daemon's reason"
+else
+    echo "FAIL: failing tool exit=$rc"; cat "$T/paste-fail.err"; exit 1
+fi
+# Over the cap: refused, not truncated.
+rm "$T/pbpaste-fail"; touch "$T/pbpaste-big"
+rc=0; "$T/pbpaste" >"$T/paste-big.out" 2>"$T/paste-big.err" || rc=$?
+rm "$T/pbpaste-big"
+if [ "$rc" = 1 ] && grep -q "exceeds 32768 bytes" "$T/paste-big.err"; then
+    echo "   oversized clipboard refused with the cap in the message"
+else
+    echo "FAIL: oversized exit=$rc"; cat "$T/paste-big.err"; exit 1
+fi
 rc=0; "$T/lemonade" >/dev/null 2>&1 || rc=$?
 [ "$rc" = 2 ] && echo "   bare lemonade prints usage (exit=2)" || { echo "FAIL: bare exit=$rc"; exit 1; }
 
 echo "== 8. clipboard, attached (stdout is a tty → OSC 52, no daemon) =="
-expected=$(printf 'term-test' | base64 -w 0)
+# tr over base64: GNU base64 needs -w 0 to stop wrapping, BSD base64
+# has no -w at all — stripping newlines is correct on both.
+expected=$(printf 'term-test' | base64 | tr -d '\n')
 if command -v script >/dev/null; then
-    script -qec "printf 'term-test' | ./target/debug/porthole clipboard" "$T/tty.log" >/dev/null
+    if script -qec true /dev/null >/dev/null 2>&1; then
+        # GNU script: the command rides the -c flag.
+        script -qec "printf 'term-test' | ./target/debug/porthole clipboard" "$T/tty.log" >/dev/null
+    else
+        # BSD script (macOS): the command is positional.
+        script -q "$T/tty.log" sh -c "printf 'term-test' | ./target/debug/porthole clipboard" >/dev/null
+    fi
     if grep -qF "$(printf '\033]52;c;')${expected}" "$T/tty.log"; then
         echo "   OSC 52 sequence emitted on the tty"
     else

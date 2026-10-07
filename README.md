@@ -87,15 +87,19 @@ On the remote, nothing changes. Every entry point routes to the client:
   when herdr is installed; without herdr, every other entry point
   still works.
 
-The clipboard bridges too: `cat foo.txt | pbcopy` puts stdin on the Mac's
-clipboard. Attached to a terminal this speaks OSC 52 directly and needs
-nothing else running. Detached, it goes through the daemon. The binary
-also answers to `lemonade` — the one clipboard provider Neovim probes
-for with no display-server gate — so on remotes every Neovim yanks to
-the Mac with zero editor configuration. The bridge is one-way:
-`lemonade paste` fails loudly rather than paste nothing silently.
-Clipboard writes are never spooled — a late paste would clobber the
-current clipboard with stale content.
+The clipboard bridges both ways. `cat foo.txt | pbcopy` puts stdin on
+the Mac's clipboard; `pbpaste` prints the Mac's clipboard back on the
+remote — one request line over the same socket, one reply line back.
+The binary also answers to `lemonade` — the one clipboard provider Neovim
+probes for with no display-server gate — so on remotes every Neovim yank
+and paste rides the Mac's clipboard with zero editor configuration.
+Copy speaks OSC 52 directly when attached to a terminal and needs nothing
+else running; detached copies and every paste go through the daemon.
+Clipboard traffic is never spooled — a late write would clobber the
+current clipboard with stale content. Note the trust direction: paste
+lets anything running as you on a remote read the Mac's clipboard, and
+the socket only exists behind your own SSH masters, so this is exactly
+as trustworthy as the remotes you point at it.
 
 Note: some tools refuse to open a browser when no display is present.
 xdg-open consults the MIME database only under `has_display`, and gcloud

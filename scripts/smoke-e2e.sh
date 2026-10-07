@@ -100,9 +100,22 @@ echo "\$1" >> "$T/opened.log"
 EOF
 chmod +x "$T/opener.sh"
 
+cat > "$T/pbcopy.sh" <<EOF
+#!/bin/sh
+cat > "$T/clipboard.txt"
+EOF
+chmod +x "$T/pbcopy.sh"
+cat > "$T/pbpaste.sh" <<EOF
+#!/bin/sh
+cat "$T/clipboard.txt" 2>/dev/null
+EOF
+chmod +x "$T/pbpaste.sh"
+
 # From here on everything porthole sees the test home.
 export HOME=$T
 export PORTHOLE_OPENER="$T/opener.sh"
+export PORTHOLE_PBCOPY="$T/pbcopy.sh"
+export PORTHOLE_PBPASTE="$T/pbpaste.sh"
 export PATH="$T/bin:$PATH"
 
 echo "== start daemon (plays the macOS side; supervisor owns the SSH master) =="
@@ -127,6 +140,16 @@ echo "   forwarded socket is live (supervisor master connected)"
 echo "== 1. direct URL through the real RemoteForward =="
 ./target/debug/porthole open https://e2e.example.com
 sleep 0.3
+
+echo "== 1b. clipboard copy + paste round-trip over the real RemoteForward =="
+# stdout to /dev/null: force the daemon path even when the rig itself
+# runs on a tty (an attached clipboard would speak OSC 52 and skip the
+# socket entirely).
+printf 'e2e clipboard' | ./target/debug/porthole clipboard >/dev/null
+sleep 0.3
+round=$(./target/debug/porthole paste 2>"$T/paste.err")
+[ "$round" = "e2e clipboard" ] || { echo "FAIL: paste round-trip got '$round'"; cat "$T/paste.err"; cat "$T/daemon.log"; exit 1; }
+echo "   copy → daemon → paste round-tripped through the forwarded socket"
 
 echo "== 2. loopback URL, one box shares loopback: expect 'local wins' =="
 echo "   (a REAL tunnel carrying traffic needs two machines — this box's =="
