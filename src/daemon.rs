@@ -562,7 +562,7 @@ pub fn status(_args: impl Iterator<Item = String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `porthole tunnel [list] | kill <port>`.
+/// `porthole tunnel [list] | kill <port> | kill all`.
 ///
 /// No admin channel is needed: the process table is the shared state.
 /// Listing scans for tunnel children; killing signals the ssh child
@@ -591,33 +591,28 @@ pub fn tunnel(args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("kill") => {
-            let Some(port) = args.next().and_then(|p| p.parse::<u16>().ok()) else {
-                eprintln!("usage: porthole tunnel kill <port>");
+            let Some(arg) = args.next() else {
+                eprintln!("usage: porthole tunnel kill <port> | kill all");
+                return ExitCode::from(2);
+            };
+            if arg == "all" {
+                return kill_all();
+            }
+            let Some(port) = arg.parse::<u16>().ok() else {
+                eprintln!("usage: porthole tunnel kill <port> | kill all");
                 return ExitCode::from(2);
             };
             // Child tunnels: signal the ssh child directly; the daemon's
             // reaper drops the registry entry when it exits.
-            let tunnels = find_tunnels();
-            if let Some(t) = tunnels.iter().find(|t| t.port == port) {
-                let status = process::Command::new("kill")
-                    .arg(t.pid.to_string())
-                    .status();
-                return match status {
-                    Ok(s) if s.success() => {
-                        println!(
-                            "killed tunnel on port {port} (pid {}, was → {})",
-                            t.pid, t.host
-                        );
-                        ExitCode::SUCCESS
-                    }
-                    Ok(s) => {
-                        eprintln!("porthole tunnel: kill exited with {s}");
-                        ExitCode::FAILURE
-                    }
-                    Err(e) => {
-                        eprintln!("porthole tunnel: failed to run kill: {e}");
-                        ExitCode::FAILURE
-                    }
+            if let Some(t) = find_tunnels().iter().find(|t| t.port == port) {
+                return if kill_child(t) {
+                    println!(
+                        "killed tunnel on port {port} (pid {}, was → {})",
+                        t.pid, t.host
+                    );
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
                 };
             }
             // Mux forwards live inside the ssh master; cancel through
@@ -627,31 +622,14 @@ pub fn tunnel(args: impl Iterator<Item = String>) -> ExitCode {
                     if !m.ports.contains(&port) {
                         continue;
                     }
-                    let status = process::Command::new("ssh")
-                        .arg("-S")
-                        .arg(dir.join(&m.host))
-                        .arg("-O")
-                        .arg("cancel")
-                        .arg("-L")
-                        .arg(format!("{port}:localhost:{port}"))
-                        .arg(&m.host)
-                        .status();
-                    return match status {
-                        Ok(s) if s.success() => {
-                            println!(
-                                "canceled mux forward on port {port} (→ {}, master pid {})",
-                                m.host, m.pid
-                            );
-                            ExitCode::SUCCESS
-                        }
-                        Ok(s) => {
-                            eprintln!("porthole tunnel: ssh -O cancel exited with {s}");
-                            ExitCode::FAILURE
-                        }
-                        Err(e) => {
-                            eprintln!("porthole tunnel: failed to run ssh -O cancel: {e}");
-                            ExitCode::FAILURE
-                        }
+                    return if cancel_forward(&dir, &m, port) {
+                        println!(
+                            "canceled mux forward on port {port} (→ {}, master pid {})",
+                            m.host, m.pid
+                        );
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
                     };
                 }
             }
@@ -660,8 +638,96 @@ pub fn tunnel(args: impl Iterator<Item = String>) -> ExitCode {
         }
         Some(other) => {
             eprintln!("porthole tunnel: unknown subcommand '{other}'");
-            eprintln!("usage: porthole tunnel [list] | kill <port>");
+            eprintln!("usage: porthole tunnel [list] | kill <port> | kill all");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `tunnel kill all`: one attempt at every tunnel the client can see —
+/// every child tunnel and every forward inside every ssh master.
+/// Best effort: one failure does not stop the sweep; the exit code
+/// reports whether every attempt succeeded. Nothing to kill is a
+/// success, same wording as `tunnel list`.
+fn kill_all() -> ExitCode {
+    let mut any = false;
+    let mut ok = true;
+    for t in &find_tunnels() {
+        any = true;
+        if kill_child(t) {
+            println!(
+                "killed tunnel on port {} (pid {}, was → {})",
+                t.port, t.pid, t.host
+            );
+        } else {
+            ok = false;
+        }
+    }
+    if let Some(dir) = tunnel::control_dir() {
+        for m in &find_mux() {
+            for port in &m.ports {
+                any = true;
+                if cancel_forward(&dir, m, *port) {
+                    println!(
+                        "canceled mux forward on port {} (→ {}, master pid {})",
+                        port, m.host, m.pid
+                    );
+                } else {
+                    ok = false;
+                }
+            }
+        }
+    }
+    if !any {
+        println!("no tunnels");
+    }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Signal a tunnel child's pid. The daemon's reaper drops the registry
+/// entry when the child exits. True when the signal was delivered.
+fn kill_child(t: &TunnelInfo) -> bool {
+    match process::Command::new("kill")
+        .arg(t.pid.to_string())
+        .status()
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("porthole tunnel: kill exited with {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("porthole tunnel: failed to run kill: {e}");
+            false
+        }
+    }
+}
+
+/// Cancel one forward inside an ssh master through its control
+/// socket. True when the master acknowledged the cancel.
+fn cancel_forward(dir: &Path, m: &MuxInfo, port: u16) -> bool {
+    let status = process::Command::new("ssh")
+        .arg("-S")
+        .arg(dir.join(&m.host))
+        .arg("-O")
+        .arg("cancel")
+        .arg("-L")
+        .arg(format!("{port}:localhost:{port}"))
+        .arg(&m.host)
+        .status();
+    match status {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("porthole tunnel: ssh -O cancel exited with {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("porthole tunnel: failed to run ssh -O cancel: {e}");
+            false
         }
     }
 }

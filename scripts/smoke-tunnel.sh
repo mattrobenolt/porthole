@@ -196,6 +196,23 @@ echo "== 8.5 tunnel subcommand =="
 rc=0; ./target/debug/porthole tunnel kill 3999 || rc=$?; echo "kill-missing exit=$rc"
 rc=0; ./target/debug/porthole tunnel frobnicate || rc=$?; echo "unknown exit=$rc"
 
+# kill all: nothing is visible to the kill sources in this rig (child
+# stubs exec nc so ps shows nc, not ssh; master check prints no pid),
+# so the sweep is a no-op. Only the exit code is assertable: find_tunnels
+# scans the REAL process table, and any ssh-shaped child caught mid-spawn
+# (stub pre-exec window) or living outside the rig is legitimately killed
+# and still exits 0. The sweep's kills themselves are verified against
+# real ssh shapes outside this rig.
+rc=0; ./target/debug/porthole tunnel kill all || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: kill all exited $rc"; exit 1; }
+echo "   kill all: sweep exits 0"
+rc=0; ./target/debug/porthole tunnel kill >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: kill with no port exited $rc (want 2)"; exit 1; }
+echo "   kill with no port: usage, exit 2"
+rc=0; ./target/debug/porthole tunnel kill xyzzy >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: kill with non-numeric port exited $rc (want 2)"; exit 1; }
+echo "   kill with non-numeric port: usage, exit 2"
+
 echo "== 9. callback reaping: a connection rode the forward, then quiet =="
 ln -sf "$T/.porthole.d/testhost.sock" "$T/.porthole.sock"
 ./target/debug/porthole open 'https://login.example.com/oauth2/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A3200%2Fcb'
