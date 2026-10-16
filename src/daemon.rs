@@ -573,11 +573,20 @@ pub fn tunnel(args: impl Iterator<Item = String>) -> ExitCode {
     match args.next().as_deref() {
         None | Some("list") => {
             let tunnels = find_tunnels();
-            if tunnels.is_empty() {
+            let muxes = find_mux();
+            let any = !tunnels.is_empty() || muxes.iter().any(|m| !m.ports.is_empty());
+            if !any {
                 println!("no tunnels");
             }
             for t in &tunnels {
                 println!("port {} → {} (pid {})", t.port, t.host, t.pid);
+            }
+            // Same two sources as `status`: child tunnels from the
+            // process table, forwards inside ssh masters from lsof.
+            for m in &muxes {
+                for port in &m.ports {
+                    println!("port {} → {} (mux, master pid {})", port, m.host, m.pid);
+                }
             }
             ExitCode::SUCCESS
         }
@@ -729,7 +738,17 @@ fn lsof_listen_ports(pid: u32) -> Vec<u16> {
         return Vec::new();
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout.lines().filter_map(parse_lsof_listen).collect()
+    parse_lsof_ports(&stdout)
+}
+
+/// lsof stdout to listen ports. ssh binds each forward on both
+/// loopback families, so lsof reports the port twice (127.0.0.1:3000
+/// and [::1]:3000); the port is one forward and appears once.
+fn parse_lsof_ports(stdout: &str) -> Vec<u16> {
+    let mut ports: Vec<u16> = stdout.lines().filter_map(parse_lsof_listen).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// One listening loopback port from an lsof output line, or None.
@@ -799,7 +818,9 @@ fn parse_tunnel<'a>(tokens: &[&'a str]) -> Option<(u16, &'a str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_lsof_listen, parse_master_pid, parse_tunnel, sniff_callback_ports};
+    use super::{
+        parse_lsof_listen, parse_lsof_ports, parse_master_pid, parse_tunnel, sniff_callback_ports,
+    };
 
     #[test]
     fn parses_our_tunnel() {
@@ -904,6 +925,28 @@ mod tests {
         assert_eq!(parse_master_pid("Master running (pid=7)"), Some(7));
         assert_eq!(parse_master_pid("No master"), None);
         assert_eq!(parse_master_pid("pid=abc)"), None);
+    }
+
+    #[test]
+    fn lsof_ports_merge_families_and_dedupe() {
+        // One forward, both loopback families: one port, sorted.
+        assert_eq!(
+            parse_lsof_ports(
+                "ssh 19055 matt 8u IPv6 0x2 0t0 TCP [::1]:1111 (LISTEN)\n\
+                 ssh 19055 matt 9u IPv4 0x1 0t0 TCP 127.0.0.1:1111 (LISTEN)\n"
+            ),
+            vec![1111]
+        );
+        // Distinct forwards stay distinct and come out sorted.
+        assert_eq!(
+            parse_lsof_ports(
+                "ssh 1 matt 9u IPv4 0x1 0t0 TCP 127.0.0.1:9222 (LISTEN)\n\
+                 ssh 1 matt 8u IPv4 0x1 0t0 TCP 127.0.0.1:3000 (LISTEN)\n\
+                 ssh 1 matt 7u IPv6 0x2 0t0 TCP [::1]:9222 (LISTEN)\n"
+            ),
+            vec![3000, 9222]
+        );
+        assert_eq!(parse_lsof_ports(""), Vec::<u16>::new());
     }
 
     #[test]
