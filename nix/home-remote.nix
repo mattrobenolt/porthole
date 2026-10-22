@@ -22,6 +22,16 @@ in
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.porthole-remote;
       description = "The porthole package to install. Use the -remote build (client only, no tokio).";
     };
+
+    zedShim = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Install a `zed` shim that forwards `zed [<path>]` to the local
+        Zed over SSH. Disable this when the remote installs its own
+        `zed` binary.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -31,7 +41,13 @@ in
     home.packages = [
       cfg.package
       pkgs.xdg-utils
-    ];
+    ]
+    ++ lib.optional cfg.zedShim (
+      pkgs.runCommandLocal "porthole-zed-shim" { } ''
+        mkdir -p $out/bin
+        ln -s ${cfg.package}/bin/porthole $out/bin/zed
+      ''
+    );
 
     # Stock xdg-open and every $BROWSER reader. The package's `open`
     # symlink argv[0]-dispatches to `porthole open`.
@@ -72,11 +88,10 @@ in
     # browser tab. Idempotent: re-linking to the current store path
     # on every switch keeps the registry in sync. Skipped silently
     # when herdr is not installed or its server is not running.
-    home.activation.linkPortholeHerdrPlugin =
-      lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-        if command -v herdr >/dev/null 2>&1; then
-          herdr plugin link ${cfg.package}/share/porthole 2>/dev/null || true
-        fi
-      '';
+    home.activation.linkPortholeHerdrPlugin = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      if command -v herdr >/dev/null 2>&1; then
+        herdr plugin link ${cfg.package}/share/porthole 2>/dev/null || true
+      fi
+    '';
   };
 }

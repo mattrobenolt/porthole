@@ -110,12 +110,19 @@ cat > "$T/pbpaste.sh" <<EOF
 cat "$T/clipboard.txt" 2>/dev/null
 EOF
 chmod +x "$T/pbpaste.sh"
+cat > "$T/zed.sh" <<EOF
+#!/bin/sh
+echo "\$1" >> "$T/zed.log"
+EOF
+chmod +x "$T/zed.sh"
 
 # From here on everything porthole sees the test home.
 export HOME=$T
+export USER=${USER:-$(id -un)}
 export PORTHOLE_OPENER="$T/opener.sh"
 export PORTHOLE_PBCOPY="$T/pbcopy.sh"
 export PORTHOLE_PBPASTE="$T/pbpaste.sh"
+export PORTHOLE_ZED="$T/zed.sh"
 export PATH="$T/bin:$PATH"
 
 echo "== start daemon (plays the macOS side; supervisor owns the SSH master) =="
@@ -150,6 +157,17 @@ sleep 0.3
 round=$(./target/debug/porthole paste 2>"$T/paste.err")
 [ "$round" = "e2e clipboard" ] || { echo "FAIL: paste round-trip got '$round'"; cat "$T/paste.err"; cat "$T/daemon.log"; exit 1; }
 echo "   copy → daemon → paste round-tripped through the forwarded socket"
+
+echo "== 1c. zed shim over the real RemoteForward =="
+ln -s "$PWD/target/debug/porthole" "$T/zed"
+mkdir -p "$T/project"
+project=$(cd "$T/project" && pwd -P)
+(cd "$T/project" && "$T/zed" .)
+sleep 0.3
+[ "$(cat "$T/zed.log" 2>/dev/null)" = "ssh://$USER@remote1$project" ] || {
+    echo "FAIL: zed got '$(cat "$T/zed.log" 2>/dev/null)'"; cat "$T/daemon.log"; exit 1
+}
+echo "   zed received the ssh URL with the daemon's host alias"
 
 echo "== 2. loopback URL, one box shares loopback: expect 'local wins' =="
 echo "   (a REAL tunnel carrying traffic needs two machines — this box's =="

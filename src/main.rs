@@ -1,7 +1,7 @@
 //! porthole — open URLs from remote machines in the local browser.
-//! One binary, seven roles: daemon, open, herdr-open, clipboard, paste,
-//! status, tunnel. Symlinks named `open`, `pbcopy`, `pbpaste`, or
-//! `lemonade` dispatch to the client, busybox-style.
+//! One binary, eight roles: daemon, open, herdr-open, zed, clipboard,
+//! paste, status, tunnel. Symlinks named `open`, `pbcopy`, `pbpaste`,
+//! `lemonade`, or `zed` dispatch to the client, busybox-style.
 
 use std::borrow::Cow;
 use std::env;
@@ -10,7 +10,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::iter::once;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, absolute};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -37,6 +37,7 @@ commands:
   paste      print the local clipboard to stdout (also: pbpaste)
   status     show daemon and tunnel state
   tunnel     inspect or kill tunnels
+  zed        open a remote path in the local Zed over SSH
 
 porthole <command> --help shows command-specific usage.
 ";
@@ -50,6 +51,7 @@ usage:
   porthole herdr-open <url>   open a URL from a herdr link handler
   porthole clipboard          set the local clipboard from stdin
   porthole paste              print the local clipboard to stdout
+  porthole zed [<path>]       open a path on this remote in the local Zed
 
 This build carries the remote client only. The daemon, status, and
 tunnel roles exist in the macOS build.
@@ -75,6 +77,7 @@ fn main() -> ExitCode {
         "pbcopy" => return clipboard(args),
         "pbpaste" => return paste(args),
         "lemonade" => return lemonade(args),
+        "zed" => return zed(args),
         _ => {}
     }
 
@@ -88,6 +91,7 @@ fn main() -> ExitCode {
         "clipboard" => clipboard(args),
         "paste" => paste(args),
         "herdr-open" => herdr_open(args),
+        "zed" => zed(args),
         #[cfg(feature = "daemon")]
         "daemon" => daemon::run(args),
         #[cfg(feature = "daemon")]
@@ -124,13 +128,29 @@ enum Request<'a> {
     Paste {
         paste: bool,
     },
+    Zed {
+        #[serde(borrow)]
+        zed: ZedTarget<'a>,
+    },
+}
+
+/// The remote half of a `zed` request: a path on this machine and the
+/// account ssh is logged in as. The daemon supplies the host alias from
+/// the socket name, so the remote never guesses how the Mac addresses it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ZedTarget<'a> {
+    #[serde(borrow)]
+    pub(crate) path: Cow<'a, str>,
+    #[serde(borrow)]
+    pub(crate) user: Cow<'a, str>,
 }
 
 /// The daemon's reply, one JSON line on the same connection, for the
-/// requests that need one. Paste is the only such request today; the
-/// write requests (Open, Clipboard) stay fire-and-forget with no ack.
-/// Success carries the clipboard; failure carries a reason, so the
-/// client fails fast on the daemon's own terms instead of timing out.
+/// requests that need one: Paste and Zed. The write requests (Open,
+/// Clipboard) stay fire-and-forget with no ack.
+/// Paste success carries the clipboard, Zed success carries `ok`, and
+/// failure carries a reason, so the client fails fast on the daemon's
+/// own terms instead of timing out.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum Response<'a> {
@@ -141,6 +161,9 @@ enum Response<'a> {
     Error {
         #[serde(borrow)]
         error: Cow<'a, str>,
+    },
+    Ok {
+        ok: bool,
     },
 }
 
@@ -193,6 +216,129 @@ fn herdr_open(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
     open(once(url))
 }
+
+/// `porthole zed` (also reachable as `zed`): open a path on this remote
+/// in the local Zed over SSH. One positional path, or the current
+/// directory. Flags are rejected rather than guessed at: this shim is a
+/// one-way bridge, not a Zed CLI reimplementation.
+fn zed(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut path = None;
+    let mut after_separator = false;
+    for arg in args.by_ref() {
+        if !after_separator {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    eprintln!("usage: zed [<path>]");
+                    return ExitCode::SUCCESS;
+                }
+                "--" => {
+                    after_separator = true;
+                    continue;
+                }
+                _ if arg.starts_with('-') => {
+                    eprintln!("zed: unsupported flag '{arg}' (this shim opens one path)");
+                    return ExitCode::from(2);
+                }
+                _ => {}
+            }
+        }
+        if path.is_some() {
+            eprintln!("zed: one path at a time");
+            return ExitCode::from(2);
+        }
+        path = Some(arg);
+    }
+
+    let Some(home) = env::home_dir() else {
+        eprintln!("zed: cannot determine home directory");
+        return ExitCode::FAILURE;
+    };
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("zed: cannot determine current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let raw = path.unwrap_or_else(|| ".".to_string());
+    let target = if raw == "~" {
+        home.clone()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        cwd.join(raw)
+    };
+    let resolved = match absolute(&target) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("zed: cannot resolve {}: {e}", target.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(path) = resolved.to_str() else {
+        eprintln!("zed: path is not valid UTF-8");
+        return ExitCode::FAILURE;
+    };
+
+    let user = env::var("USER")
+        .or_else(|_| env::var("LOGNAME"))
+        .unwrap_or_default();
+    if user.is_empty() {
+        eprintln!("zed: cannot determine the remote username");
+        return ExitCode::FAILURE;
+    }
+
+    let sock = home.join(".porthole.sock");
+    let spool = home.join(".porthole.spool");
+    match zed_inner(&sock, &spool, path, &user) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("zed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Send the request and wait for the daemon's one-line ack. No spool:
+/// a stale `zed .` from hours ago would steal focus at a random later
+/// moment, which is worse than a clear failure now.
+fn zed_inner(sock: &Path, spool: &Path, path: &str, user: &str) -> io::Result<()> {
+    let mut stream = UnixStream::connect(sock).map_err(|e| {
+        if unreachable(&e) {
+            io::Error::other("daemon unreachable (zed needs a live connection)")
+        } else {
+            e
+        }
+    })?;
+    stream.set_write_timeout(Some(ZED_TIMEOUT))?;
+
+    flush_spool(&mut stream, spool)?;
+    write_request(
+        &mut stream,
+        &Request::Zed {
+            zed: ZedTarget {
+                path: Cow::Borrowed(path),
+                user: Cow::Borrowed(user),
+            },
+        },
+    )?;
+
+    let line = read_reply(&mut stream, ZED_TIMEOUT)?;
+    match serde_json::from_str::<Response>(line.trim_end()) {
+        Ok(Response::Ok { ok: true }) => Ok(()),
+        Ok(Response::Error { error }) => Err(io::Error::other(error.into_owned())),
+        Ok(_) => Err(io::Error::other("unexpected reply from daemon")),
+        Err(e) => Err(io::Error::other(format!(
+            "malformed reply from daemon: {e}"
+        ))),
+    }
+}
+
+/// How long the `zed` shim waits for the daemon to hand the URL to the
+/// local Zed CLI. The CLI returns as soon as it hands off; the margin is
+/// for a cold app launch.
+const ZED_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Deliberately blocking std I/O: one connect and a few writes, no
 /// concurrency, in a short-lived process. Tokio earns its keep in the
@@ -380,34 +526,7 @@ fn paste_inner(sock: &Path, spool: &Path) -> io::Result<()> {
     flush_spool(&mut stream, spool)?;
     write_request(&mut stream, &Request::Paste { paste: true })?;
 
-    // One bounded line back. The daemon enforces the same cap on its
-    // replies as on its reads, so a longer line means the protocol
-    // broke, not that patience should increase.
-    let mut line = String::new();
-    let n = match io::BufReader::new(&mut stream)
-        .take(MAX_REPLY_LINE as u64 + 1)
-        .read_line(&mut line)
-    {
-        Ok(n) => n,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            return Err(io::Error::other(format!(
-                "no reply within {} s (busy daemon, or one built before the paste bridge)",
-                PASTE_TIMEOUT.as_secs()
-            )));
-        }
-        Err(e) => return Err(e),
-    };
-    if n == 0 {
-        return Err(io::Error::other(
-            "daemon closed the connection without replying (old daemon without paste support?)",
-        ));
-    }
-    if line.len() > MAX_REPLY_LINE {
-        return Err(io::Error::other(format!(
-            "reply exceeds {MAX_REPLY_LINE} bytes"
-        )));
-    }
-
+    let line = read_reply(&mut stream, PASTE_TIMEOUT)?;
     match serde_json::from_str::<Response>(line.trim_end()) {
         Ok(Response::Clipboard { clipboard }) => {
             io::stdout().write_all(clipboard.as_bytes())?;
@@ -415,6 +534,7 @@ fn paste_inner(sock: &Path, spool: &Path) -> io::Result<()> {
             Ok(())
         }
         Ok(Response::Error { error }) => Err(io::Error::other(error.into_owned())),
+        Ok(Response::Ok { .. }) => Err(io::Error::other("unexpected reply from daemon")),
         Err(e) => Err(io::Error::other(format!(
             "malformed reply from daemon: {e}"
         ))),
@@ -425,6 +545,38 @@ fn paste_inner(sock: &Path, spool: &Path) -> io::Result<()> {
 /// against one SSH round trip plus pbpaste; short enough that an
 /// editor calling this as a provider recovers before the user notices.
 const PASTE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One bounded reply line. The daemon enforces the same cap on its
+/// replies as on its reads, so a longer line means the protocol broke,
+/// not that patience should increase.
+fn read_reply(stream: &mut UnixStream, timeout: Duration) -> io::Result<String> {
+    stream.set_read_timeout(Some(timeout))?;
+    let mut line = String::new();
+    let n = match io::BufReader::new(stream)
+        .take(MAX_REPLY_LINE as u64 + 1)
+        .read_line(&mut line)
+    {
+        Ok(n) => n,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            return Err(io::Error::other(format!(
+                "no reply within {} s",
+                timeout.as_secs()
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    if n == 0 {
+        return Err(io::Error::other(
+            "daemon closed the connection without replying",
+        ));
+    }
+    if line.len() > MAX_REPLY_LINE {
+        return Err(io::Error::other(format!(
+            "reply exceeds {MAX_REPLY_LINE} bytes"
+        )));
+    }
+    Ok(line)
+}
 
 /// The largest reply line the client accepts, mirroring the daemon's
 /// inbound line cap. (Not imported from daemon.rs: that module is
@@ -509,6 +661,15 @@ mod tests {
         assert!(matches!(paste, Request::Paste { paste: true }));
         let wire = serde_json::to_string(&Request::Paste { paste: true }).unwrap();
         assert_eq!(wire, r#"{"paste":true}"#);
+
+        let zed: Request =
+            serde_json::from_str(r#"{"zed":{"path":"/Users/matt/code/porthole","user":"matt"}}"#)
+                .unwrap();
+        let Request::Zed { zed } = zed else {
+            panic!("expected Zed");
+        };
+        assert_eq!(zed.path, "/Users/matt/code/porthole");
+        assert_eq!(zed.user, "matt");
     }
 
     #[test]
@@ -524,5 +685,8 @@ mod tests {
             panic!("expected Error reply");
         };
         assert_eq!(error, "boom");
+
+        let ok: Response = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(matches!(ok, Response::Ok { ok: true }));
     }
 }

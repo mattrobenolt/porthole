@@ -41,6 +41,16 @@ in
         match the Host aliases in your ssh config.
       '';
     };
+
+    zedCommand = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/Applications/Zed.app/Contents/MacOS/cli";
+      description = ''
+        Path to the Zed CLI for `zed` requests. When null, the daemon
+        probes the usual app-bundle and PATH locations.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -58,6 +68,9 @@ in
         RunAtLoad = true;
         StandardOutPath = "${home}/Library/Logs/porthole.log";
         StandardErrorPath = "${home}/Library/Logs/porthole.log";
+      }
+      // lib.optionalAttrs (cfg.zedCommand != null) {
+        EnvironmentVariables.PORTHOLE_ZED = cfg.zedCommand;
       };
     };
 

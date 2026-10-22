@@ -48,10 +48,13 @@ imports = [ inputs.porthole.homeModules.porthole-daemon ];
 programs.porthole = {
   enable = true;
   hosts = [ "dev1" "launchpad" ];  # must match your ssh Host aliases
+  # zedCommand = "/Applications/Zed.app/Contents/MacOS/cli";
 };
 ```
 
-The module runs the daemon under launchd. The daemon owns its SSH master
+The module runs the daemon under launchd. It probes the usual Zed CLI
+locations; set `zedCommand` or the daemon's `PORTHOLE_ZED` environment
+variable for a non-standard install. The daemon owns its SSH master
 connections — you no longer need an interactive SSH session for porthole to
 work. Your existing `ssh`, `herdr --remote`, and Zed sessions are unaffected
 (they keep their own multiplexing).
@@ -81,6 +84,11 @@ On the remote, nothing changes. Every entry point routes to the client:
 - `gio open <url>` through the registered MIME handler
 - a plain `open <url>` shim for macOS-style callers
 - `porthole open <url>` directly
+- `zed .` (or `zed <path>`) opens that path on the remote in the local
+  Zed over SSH. The remote module installs a `zed` shim by default;
+  set `programs.porthole.zedShim = false` if the remote has its own
+  `zed` binary. The daemon uses the ssh Host alias porthole already
+  knows for that remote, so the URL matches your existing ssh config.
 - **Ctrl+click on a loopback URL in a herdr pane** — the home-manager
   module links a plugin manifest that routes loopback URLs to
   `porthole open` instead of a dead browser tab. This is automatic

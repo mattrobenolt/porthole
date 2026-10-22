@@ -19,12 +19,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::runtime::Builder;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use url::Url;
 
 use crate::connection::Supervisor;
 use crate::tunnel::{self, Ensure, Purpose, Registry};
-use crate::{CLIPBOARD_MAX, Request, Response};
+use crate::{CLIPBOARD_MAX, Request, Response, ZedTarget};
 
 /// Entry point for `porthole daemon <host>...`.
 ///
@@ -247,9 +247,10 @@ async fn handle_line(
     match request {
         Request::Open { url } => handle_open(host, &url, registry).await,
         Request::Clipboard { clipboard } => set_clipboard(host, &clipboard).await,
-        // The only request that gets a reply. The writer rides along
-        // for this arm alone; every write request stays fire-and-forget.
+        // These requests get a reply. The writer rides along for these
+        // arms alone; every other write request stays fire-and-forget.
         Request::Paste { .. } => reply_paste(host, writer).await,
+        Request::Zed { zed } => reply_zed(host, &zed, writer).await,
     }
 }
 
@@ -259,34 +260,68 @@ async fn handle_line(
 /// client's problem; its read timeout owns that side.
 async fn reply_paste(host: &str, writer: &mut BufReader<UnixStream>) {
     let response = read_clipboard(host).await;
-    let mut line = match serde_json::to_string(&response) {
+    write_reply(host, writer, &response).await;
+}
+
+/// Build the SSH URL for a remote path and hand it to the local Zed
+/// CLI. The host alias comes from the socket name, so the URL uses the
+/// same ssh configuration the user already uses interactively.
+async fn reply_zed(host: &str, target: &ZedTarget<'_>, writer: &mut BufReader<UnixStream>) {
+    let response = match zed_url(host, target) {
+        Ok(url) => {
+            eprintln!("porthole daemon: {host}: zed {url}");
+            match launch_zed(&url).await {
+                Ok(()) => Response::Ok { ok: true },
+                Err(e) => {
+                    eprintln!("porthole daemon: {host}: zed failed: {e}");
+                    Response::Error {
+                        error: Cow::Owned(e.to_string()),
+                    }
+                }
+            }
+        }
+        Err(reason) => {
+            eprintln!("porthole daemon: {host}: rejected zed request: {reason}");
+            Response::Error {
+                error: Cow::Owned(reason),
+            }
+        }
+    };
+    write_reply(host, writer, &response).await;
+}
+
+/// Serialize one reply line, enforce the same wire cap as the inbound
+/// side, and write it. A client that is gone is not worth a task of its
+/// own; the log line is the record.
+async fn write_reply(host: &str, writer: &mut BufReader<UnixStream>, response: &Response<'_>) {
+    let mut line = match serde_json::to_string(response) {
         Ok(l) => l,
         Err(e) => {
             // Serializing plain strings cannot fail, but stay loud
             // rather than reply nothing.
-            eprintln!("porthole daemon: {host}: serializing paste reply: {e}");
+            eprintln!("porthole daemon: {host}: serializing reply: {e}");
             return;
         }
     };
     // A 32 KiB clipboard of control characters escapes to six times
     // that in JSON. The client reads one bounded line, so the reply
-    // must keep that bargain or refuse the paste outright.
+    // must keep that bargain or refuse the request outright.
     if line.len() > MAX_LINE {
         eprintln!(
-            "porthole daemon: {host}: paste reply of {} bytes exceeds the {}-byte line, refusing",
+            "porthole daemon: {host}: reply of {} bytes exceeds the {}-byte line, refusing",
             line.len(),
             MAX_LINE
         );
-        line = r#"{"error":"clipboard too large for the wire line"}"#.to_string();
+        line = r#"{"error":"reply too large for the wire line"}"#.to_string();
     }
     line.push('\n');
     let stream = writer.get_mut();
     if let Err(e) = stream.write_all(line.as_bytes()).await {
-        eprintln!("porthole daemon: {host}: writing paste reply: {e}");
+        eprintln!("porthole daemon: {host}: writing reply: {e}");
         return;
     }
     if let Err(e) = stream.flush().await {
-        eprintln!("porthole daemon: {host}: flushing paste reply: {e}");
+        eprintln!("porthole daemon: {host}: flushing reply: {e}");
     }
 }
 
@@ -882,11 +917,162 @@ fn parse_tunnel<'a>(tokens: &[&'a str]) -> Option<(u16, &'a str)> {
     (local == remote).then_some((local, *host))
 }
 
+/// Validate a remote path and turn it into the SSH URL Zed's CLI
+/// accepts. The path must be absolute and the user must look like a POSIX
+/// account; everything else is percent-encoded by the URL builder.
+fn zed_url(host: &str, target: &ZedTarget<'_>) -> Result<String, String> {
+    let path = target.path.as_ref();
+    if path.is_empty() || !path.starts_with('/') {
+        return Err(format!("zed path must be absolute, got '{path}'"));
+    }
+    if path.chars().any(char::is_control) {
+        return Err("zed path contains control characters".to_string());
+    }
+
+    let user = target.user.as_ref();
+    let user_ok = !user.is_empty()
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'));
+    if !user_ok {
+        return Err(format!("invalid ssh user '{user}'"));
+    }
+
+    let mut url = Url::parse(&format!("ssh://{host}/"))
+        .map_err(|e| format!("invalid host alias '{host}': {e}"))?;
+    url.set_username(user)
+        .map_err(|()| format!("invalid ssh user '{user}'"))?;
+    url.set_path(path);
+    Ok(url.into())
+}
+
+/// How long the daemon lets the Zed CLI run. It normally exits as soon
+/// as it hands the URL to the app; a cold launch gets a wide margin.
+const ZED_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// PORTHOLE_ZED is the same kind of test seam as PORTHOLE_OPENER. When it
+/// is unset, prefer the app bundle's CLI over PATH: launchd gives a
+/// daemon a minimal PATH, and the CLI installed on PATH is often just a
+/// symlink into that bundle anyway.
+async fn launch_zed(url: &str) -> io::Result<()> {
+    let program = zed_command();
+    let spawned = Command::new(&program).arg(url).kill_on_drop(true).spawn();
+    let mut child = spawned.map_err(|e| {
+        io::Error::other(format!(
+            "failed to spawn '{program}': {e} (set PORTHOLE_ZED to the Zed CLI path)"
+        ))
+    })?;
+
+    match timeout(ZED_LAUNCH_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(io::Error::other(format!(
+            "'{program}' exited with {status}"
+        ))),
+        Ok(Err(e)) => Err(io::Error::other(format!("waiting for '{program}': {e}"))),
+        Err(_) => Err(io::Error::other(format!(
+            "'{program}' did not exit within {} s",
+            ZED_LAUNCH_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+fn zed_command() -> String {
+    if let Ok(program) = env::var("PORTHOLE_ZED") {
+        return program;
+    }
+    // Prefer the installed CLI over an app bundle: the CLI is what the
+    // user's `zed` resolves to, and on this machine that may be the
+    // Preview channel while `/Applications/Zed.app` is stable.
+    let mut candidates = vec![
+        PathBuf::from("/usr/local/bin/zed"),
+        PathBuf::from("/opt/homebrew/bin/zed"),
+    ];
+    if let Some(home) = env::home_dir() {
+        candidates.extend([
+            home.join(".nix-profile/bin/zed"),
+            home.join(".local/bin/zed"),
+            home.join("Applications/Zed.app/Contents/MacOS/cli"),
+            home.join("Applications/Zed Preview.app/Contents/MacOS/cli"),
+        ]);
+    }
+    candidates.extend([
+        PathBuf::from("/Applications/Zed.app/Contents/MacOS/cli"),
+        PathBuf::from("/Applications/Zed Preview.app/Contents/MacOS/cli"),
+    ]);
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "zed".to_string()
+}
+
+/// PORTHOLE_OPENER is a test seam: on macOS this is /usr/bin/open; under
+/// test it is a script that logs instead of launching a browser.
+async fn open_url(url: &str) -> io::Result<()> {
+    let opener = env::var("PORTHOLE_OPENER").unwrap_or_else(|_| "/usr/bin/open".to_string());
+    let status = Command::new(opener).arg(url).status().await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("opener exited with {status}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         parse_lsof_listen, parse_lsof_ports, parse_master_pid, parse_tunnel, sniff_callback_ports,
+        zed_url,
     };
+    use crate::ZedTarget;
+    use std::borrow::Cow;
+
+    #[test]
+    fn builds_zed_ssh_urls() {
+        let target = ZedTarget {
+            path: Cow::Borrowed("/Users/matt/code/porthole"),
+            user: Cow::Borrowed("matt"),
+        };
+        assert_eq!(
+            zed_url("launchpad", &target).unwrap(),
+            "ssh://matt@launchpad/Users/matt/code/porthole"
+        );
+
+        let spaced = ZedTarget {
+            path: Cow::Borrowed("/Users/matt/code/two words"),
+            user: Cow::Borrowed("matt"),
+        };
+        assert_eq!(
+            zed_url("launchpad", &spaced).unwrap(),
+            "ssh://matt@launchpad/Users/matt/code/two%20words"
+        );
+        assert_eq!(
+            zed_url("dev_1", &target).unwrap(),
+            "ssh://matt@dev_1/Users/matt/code/porthole"
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_zed_targets() {
+        let relative = ZedTarget {
+            path: Cow::Borrowed("code/porthole"),
+            user: Cow::Borrowed("matt"),
+        };
+        assert!(zed_url("launchpad", &relative).is_err());
+
+        let bad_user = ZedTarget {
+            path: Cow::Borrowed("/tmp"),
+            user: Cow::Borrowed("matt@elsewhere"),
+        };
+        assert!(zed_url("launchpad", &bad_user).is_err());
+
+        let control = ZedTarget {
+            path: Cow::Borrowed("/tmp/evil\npath"),
+            user: Cow::Borrowed("matt"),
+        };
+        assert!(zed_url("launchpad", &control).is_err());
+    }
 
     #[test]
     fn parses_our_tunnel() {
@@ -1045,17 +1231,5 @@ mod tests {
             parse_lsof_listen("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME"),
             None
         );
-    }
-}
-
-/// PORTHOLE_OPENER is a test seam: on macOS this is /usr/bin/open; under
-/// test it is a script that logs instead of launching a browser.
-async fn open_url(url: &str) -> io::Result<()> {
-    let opener = env::var("PORTHOLE_OPENER").unwrap_or_else(|_| "/usr/bin/open".to_string());
-    let status = Command::new(opener).arg(url).status().await?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("opener exited with {status}")))
     }
 }

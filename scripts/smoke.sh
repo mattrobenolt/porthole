@@ -39,10 +39,18 @@ cat "$T/clipboard.txt" 2>/dev/null
 EOF
 chmod +x "$T/pbpaste.sh"
 
+cat > "$T/zed.sh" <<EOF
+#!/bin/sh
+echo "\$1" >> "$T/zed.log"
+EOF
+chmod +x "$T/zed.sh"
+
 export HOME=$T
+export USER=${USER:-$(id -un)}
 export PORTHOLE_OPENER="$T/opener.sh"
 export PORTHOLE_PBCOPY="$T/pbcopy.sh"
 export PORTHOLE_PBPASTE="$T/pbpaste.sh"
+export PORTHOLE_ZED="$T/zed.sh"
 
 echo "== start daemon for host 'testhost' =="
 ./target/debug/porthole daemon testhost 2>"$T/daemon.log" &
@@ -55,6 +63,27 @@ ln -s "$T/.porthole.d/testhost.sock" "$T/.porthole.sock"
 
 echo "== 1. direct URL via the real client =="
 ./target/debug/porthole open https://example.com
+
+echo "== 1b. zed shim: remote cwd becomes an ssh URL for the local Zed =="
+ln -s "$PWD/target/debug/porthole" "$T/zed"
+mkdir -p "$T/project"
+(cd "$T/project" && "$T/zed" .)
+(cd "$T/project" && "$T/zed" "two words")
+sleep 0.2
+expected="ssh://$USER@testhost$T/project"
+expected_spaced="ssh://$USER@testhost$T/project/two%20words"
+if [ "$(sed -n 1p "$T/zed.log")" = "$expected" ] &&
+   [ "$(sed -n 2p "$T/zed.log")" = "$expected_spaced" ]; then
+    echo "   zed received both URLs"
+else
+    echo "FAIL: zed received:"; cat "$T/zed.log"; exit 1
+fi
+
+rc=0; "$T/zed" a b >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && echo "   multiple paths rejected (exit=2)" || { echo "FAIL: multiple paths exit=$rc"; exit 1; }
+
+rc=0; "$T/zed" --foreground >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && echo "   unsupported flags rejected (exit=2)" || { echo "FAIL: unsupported flag exit=$rc"; exit 1; }
 
 echo "== 2. loopback URL (tunnel deferred to milestone 3) =="
 ./target/debug/porthole open http://localhost:3000
@@ -179,5 +208,10 @@ sleep 0.7
 rc=0; printf 'never' | ./target/debug/porthole clipboard || rc=$?
 echo "   exit=$rc (expect 1)"
 [ ! -e "$T/.porthole.spool" ] && echo "   no spool written" || { echo "FAIL: clipboard was spooled"; exit 1; }
+
+rc=0; (cd "$T/project" && "$T/zed" .) >/dev/null 2>"$T/zed-down.err" || rc=$?
+[ "$rc" = 1 ] && grep -q "daemon unreachable" "$T/zed-down.err" && \
+    echo "   zed fails fast with the daemon down" || { echo "FAIL: zed down exit=$rc"; cat "$T/zed-down.err"; exit 1; }
+[ ! -e "$T/.porthole.spool" ] && echo "   zed was not spooled" || { echo "FAIL: zed request was spooled"; exit 1; }
 
 echo "== smoke test passed =="

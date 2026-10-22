@@ -43,6 +43,8 @@ OAuth flows get the same treatment from the other direction. The authorize URL c
 
 **Client.** The `open` subcommand. It writes one JSON line to `~/.porthole.sock`. If the socket is absent or refused, it appends to `~/.porthole.spool`. Each invocation flushes the spool first when the socket accepts connections.
 
+**Zed shim.** The home-manager module links `zed` to the client (on by default; `zedShim = false` disables it). The shim resolves one path to an absolute remote path and sends `{"zed":{"path":...,"user":...}}`. The daemon takes the host alias from the socket name and builds `ssh://<user>@<host>/<path>`, then runs the local Zed CLI. The URL matches the user's existing ssh config because the alias is the same one porthole already uses. Zed requests get a reply and are never spooled: a stale `zed .` must not steal focus later. The CLI path is probed in the app bundle and PATH; `PORTHOLE_ZED` overrides it.
+
 **Browser registration.** Fully declarative through home-manager. `xdg.desktopEntries` provides `porthole.desktop`. `xdg.mimeApps.defaultApplications` binds `x-scheme-handler/http` and `x-scheme-handler/https`. `home.sessionVariables.BROWSER` covers stock `xdg-open` and every tool that reads `$BROWSER`. A small `open` shim covers macOS-style calls. `home.sessionVariables.DISPLAY` spoofs a display for launchers that gate on one (gcloud's `check_browser.py` requires `DISPLAY`, `WAYLAND_DISPLAY`, or `MIR_SOCKET` and never reads `$BROWSER`). Debian alternatives do not apply on NixOS.
 
 **sshd hygiene.** `services.openssh.settings.StreamLocalBindUnlink = true` lets sshd replace a stale remote socket on reconnect.
@@ -90,8 +92,8 @@ sequenceDiagram
 ```mermaid
 flowchart TB
   subgraph R["NixOS remote (one per box)"]
-    E["Entry points: xdg-open · $BROWSER · gio/mimeapps · open shim · herdr link handler"]
-    C["porthole open"]
+    E["Entry points: xdg-open · $BROWSER · gio/mimeapps · open shim · zed shim · herdr link handler"]
+    C["porthole open · porthole zed"]
     RS["~/.porthole.sock"]
     SP[("Spool ~/.porthole.spool")]
     E --> C
@@ -130,6 +132,8 @@ Two remotes can serve the same loopback port at the same time. The first tunnel 
 | SSH transport | daemon supervisor | `ssh -N -M` per host, `~/.porthole.d/master/<host>` |
 | Remote socket hygiene | NixOS | `services.openssh.settings.StreamLocalBindUnlink` |
 | Browser registration | home-manager on NixOS | `xdg.mimeApps`, `xdg.desktopEntries`, `sessionVariables.BROWSER` |
+| Zed shim | home-manager on NixOS | `zed` symlink to the client (default on) |
+| Local Zed launch | daemon | Probed app bundle/PATH, `PORTHOLE_ZED` override |
 | Click routing in TUI | herdr | Plugin link handler, linked by a home-manager activation |
 
 ## 8. Failure modes
@@ -142,6 +146,7 @@ Two remotes can serve the same loopback port at the same time. The first tunnel 
 - **Stale local control socket.** The daemon probes every control socket with a connect before use; a stale file (nobody listening) is unlinked so it never clogs the mux path or child tunnels with "ControlSocket already exists."
 - **Local port already bound by an unrelated local process.** Local wins. The daemon opens the URL without a tunnel and logs the decision. Explicit remapping is the escape hatch.
 - **Callback URLs the sniff cannot see.** SAML CLI flows hide the ACS URL inside the base64 SAMLRequest blob; oauth-proxy interstitials double-encode it. Those flows break at the redirect. If one bites, the fix is an explicit `porthole forward <port>` verb on the remote — a one-line protocol addition, deliberately not built yet.
+- **Local Zed missing or outside the probed paths.** The `zed` shim gets the daemon's error reply instead of a silent no-op. Set `programs.porthole.zedCommand` on the Mac or `PORTHOLE_ZED` in the daemon environment.
 - **herdr not installed.** Everything except click routing still works.
 
 ## 9. What we build
