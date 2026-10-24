@@ -23,7 +23,7 @@ OAuth flows get the same treatment from the other direction. The authorize URL c
 
 ### 3.1 macOS host
 
-**Daemon.** Listens on one Unix socket per remote host under `~/.porthole.d/`. Validates URLs. Manages tunnels. Calls `open`. A launchd agent owns the process and restarts it after a crash.
+**Daemon.** Listens on one Unix socket per remote host under `~/.porthole.d/`. Validates URLs and paths. Manages tunnels. Calls `open`. A launchd agent owns the process and restarts it after a crash.
 
 **Connection supervisor.** The daemon owns a persistent `ssh -N -M` master per host on a dedicated control socket at `~/.porthole.d/master/<host>`. This master carries the RemoteForward (request delivery from the remote) and serves as the control socket for on-demand `-L` tunnel forwards. When the connection dies — laptop sleep, network loss — a supervisor task respawns it with exponential backoff (1s → 30s). The daemon never depends on externally-managed SSH sessions (herdr, Zed, terminals); those keep their own multiplexing on a separate ControlPath (`~/.porthole.d/control/%n`) and do not interfere. On startup, any master left behind by a previous daemon (crash, kill -9) is stopped via `ssh -O exit` before the new one spawns.
 
@@ -44,6 +44,10 @@ OAuth flows get the same treatment from the other direction. The authorize URL c
 **Client.** The `open` subcommand. It writes one JSON line to `~/.porthole.sock`. If the socket is absent or refused, it appends to `~/.porthole.spool`. Each invocation flushes the spool first when the socket accepts connections.
 
 **Zed shim.** The home-manager module links `zed` to the client (on by default; `zedShim = false` disables it). The shim resolves one path to an absolute remote path and sends `{"zed":{"path":...,"user":...}}`. The daemon takes the host alias from the socket name and builds `ssh://<user>@<host>/<path>`, then runs the local Zed CLI. The URL matches the user's existing ssh config because the alias is the same one porthole already uses. Zed requests get a reply and are never spooled: a stale `zed .` must not steal focus later. The CLI path is probed in the app bundle and PATH; `PORTHOLE_ZED` overrides it.
+
+**Path opens.** The same `open` shim that carries URLs also accepts a file path. It resolves `~` and relative paths the way the Zed shim does, then sends `{"path":...}`. The daemon requires an absolute path without control characters. The same path must also exist on the Mac. The user syncs the trees and porthole transfers nothing. When the path exists, the daemon runs the opener on it. Otherwise it replies with the reason and the remote prints it.
+
+Path requests get a reply and are never spooled. A stale open would steal focus hours later, which is why Zed requests are not spooled either. The trust is the same as the URL verb: a remote can open any file that already exists locally, including app bundles.
 
 **Browser registration.** Fully declarative through home-manager. `xdg.desktopEntries` provides `porthole.desktop`. `xdg.mimeApps.defaultApplications` binds `x-scheme-handler/http` and `x-scheme-handler/https`. `home.sessionVariables.BROWSER` covers stock `xdg-open` and every tool that reads `$BROWSER`. A small `open` shim covers macOS-style calls. `home.sessionVariables.DISPLAY` spoofs a display for launchers that gate on one (gcloud's `check_browser.py` requires `DISPLAY`, `WAYLAND_DISPLAY`, or `MIR_SOCKET` and never reads `$BROWSER`). Debian alternatives do not apply on NixOS.
 
@@ -147,6 +151,7 @@ Two remotes can serve the same loopback port at the same time. The first tunnel 
 - **Local port already bound by an unrelated local process.** Local wins. The daemon opens the URL without a tunnel and logs the decision. Explicit remapping is the escape hatch.
 - **Callback URLs the sniff cannot see.** SAML CLI flows hide the ACS URL inside the base64 SAMLRequest blob; oauth-proxy interstitials double-encode it. Those flows break at the redirect. If one bites, the fix is an explicit `porthole forward <port>` verb on the remote — a one-line protocol addition, deliberately not built yet.
 - **Local Zed missing or outside the probed paths.** The `zed` shim gets the daemon's error reply instead of a silent no-op. Set `programs.porthole.zedCommand` on the Mac or `PORTHOLE_ZED` in the daemon environment.
+- **A remote path with no local counterpart.** The daemon replies with `'<path>' does not exist on this Mac` and the remote prints it. Nothing is fetched and nothing is spooled, so the failure lands on the machine that asked.
 - **herdr not installed.** Everything except click routing still works.
 
 ## 9. What we build
@@ -165,7 +170,7 @@ Scope notes, not doctrine — most of these fall when they itch. Two are load-be
 - No supervision through herdr startup hooks.
 - No idle reaping of dev-server tunnels. Sniffed callback forwards are reaped after their one redirect (2026-09-11); see the callback reaper in 3.1.
 - No Linux or Windows local host. No WSL.
-- Only `http` and `https` URLs pass validation.
+- Only `http` and `https` URLs pass URL validation. A path is a separate request: it never spools and the daemon opens it only if the same path exists locally.
 
 ## 11. Open decisions
 

@@ -246,6 +246,7 @@ async fn handle_line(
     };
     match request {
         Request::Open { url } => handle_open(host, &url, registry).await,
+        Request::Path { path } => reply_open_path(host, &path, writer).await,
         Request::Clipboard { clipboard } => set_clipboard(host, &clipboard).await,
         // These requests get a reply. The writer rides along for these
         // arms alone; every other write request stays fire-and-forget.
@@ -280,12 +281,45 @@ async fn reply_zed(host: &str, target: &ZedTarget<'_>, writer: &mut BufReader<Un
                 }
             }
         }
-        Err(reason) => {
-            eprintln!("porthole daemon: {host}: rejected zed request: {reason}");
-            Response::Error {
-                error: Cow::Owned(reason),
+        Err(reason) => rejected(host, "zed request", reason),
+    };
+    write_reply(host, writer, &response).await;
+}
+
+/// One rejection path for both path-carrying verbs: log it, and hand the
+/// same sentence back so the remote sees the daemon's reason.
+fn rejected(host: &str, what: &str, reason: String) -> Response<'static> {
+    eprintln!("porthole daemon: {host}: rejected {what}: {reason}");
+    Response::Error {
+        error: Cow::Owned(reason),
+    }
+}
+
+/// `open <path>`: open a remote-supplied path in the Mac's default
+/// application, but only when the same path exists here. The trees are
+/// the user's to sync; this bridge opens a local file and never
+/// transfers one, so a missing path is a reply the remote can show
+/// instead of a dead Finder window on the Mac.
+async fn reply_open_path(host: &str, path: &str, writer: &mut BufReader<UnixStream>) {
+    let response = match validate_path("open", path) {
+        Ok(()) if !Path::new(path).exists() => rejected(
+            host,
+            "open path request",
+            format!("'{path}' does not exist on this Mac"),
+        ),
+        Ok(()) => {
+            eprintln!("porthole daemon: {host}: open {path}");
+            match open_locally(path).await {
+                Ok(()) => Response::Ok { ok: true },
+                Err(e) => {
+                    eprintln!("porthole daemon: {host}: opener failed: {e}");
+                    Response::Error {
+                        error: Cow::Owned(e.to_string()),
+                    }
+                }
             }
         }
+        Err(reason) => rejected(host, "open path request", reason),
     };
     write_reply(host, writer, &response).await;
 }
@@ -478,7 +512,7 @@ async fn set_clipboard(host: &str, text: &str) {
 
 async fn open_and_log(host: &str, url: &str) {
     eprintln!("porthole daemon: {host}: open {url}");
-    if let Err(e) = open_url(url).await {
+    if let Err(e) = open_locally(url).await {
         eprintln!("porthole daemon: {host}: opener failed: {e}");
     }
 }
@@ -922,12 +956,7 @@ fn parse_tunnel<'a>(tokens: &[&'a str]) -> Option<(u16, &'a str)> {
 /// account; everything else is percent-encoded by the URL builder.
 fn zed_url(host: &str, target: &ZedTarget<'_>) -> Result<String, String> {
     let path = target.path.as_ref();
-    if path.is_empty() || !path.starts_with('/') {
-        return Err(format!("zed path must be absolute, got '{path}'"));
-    }
-    if path.chars().any(char::is_control) {
-        return Err("zed path contains control characters".to_string());
-    }
+    validate_path("zed", path)?;
 
     let user = target.user.as_ref();
     let user_ok = !user.is_empty()
@@ -944,6 +973,20 @@ fn zed_url(host: &str, target: &ZedTarget<'_>) -> Result<String, String> {
         .map_err(|()| format!("invalid ssh user '{user}'"))?;
     url.set_path(path);
     Ok(url.into())
+}
+
+/// The checks every remote-supplied filesystem path gets: absolute and
+/// free of control characters, so it can never be read as a flag or
+/// smuggle anything into a log line. Existence is the caller's question
+/// — Zed resolves the path on the remote, `open` needs a local copy.
+fn validate_path(verb: &str, path: &str) -> Result<(), String> {
+    if path.is_empty() || !path.starts_with('/') {
+        return Err(format!("{verb} path must be absolute, got '{path}'"));
+    }
+    if path.chars().any(char::is_control) {
+        return Err(format!("{verb} path contains control characters"));
+    }
+    Ok(())
 }
 
 /// How long the daemon lets the Zed CLI run. It normally exits as soon
@@ -1008,10 +1051,11 @@ fn zed_command() -> String {
 }
 
 /// PORTHOLE_OPENER is a test seam: on macOS this is /usr/bin/open; under
-/// test it is a script that logs instead of launching a browser.
-async fn open_url(url: &str) -> io::Result<()> {
+/// test it is a script that logs instead of launching anything. URLs and
+/// paths share the same call, which is the point: `open(1)` takes both.
+async fn open_locally(argument: &str) -> io::Result<()> {
     let opener = env::var("PORTHOLE_OPENER").unwrap_or_else(|_| "/usr/bin/open".to_string());
-    let status = Command::new(opener).arg(url).status().await?;
+    let status = Command::new(opener).arg(argument).status().await?;
     if status.success() {
         Ok(())
     } else {
@@ -1023,10 +1067,20 @@ async fn open_url(url: &str) -> io::Result<()> {
 mod tests {
     use super::{
         parse_lsof_listen, parse_lsof_ports, parse_master_pid, parse_tunnel, sniff_callback_ports,
-        zed_url,
+        validate_path, zed_url,
     };
     use crate::ZedTarget;
     use std::borrow::Cow;
+
+    #[test]
+    fn validates_remote_paths() {
+        assert!(validate_path("open", "/Users/matt/code/porthole").is_ok());
+        assert!(validate_path("open", "/tmp/two words").is_ok());
+        assert!(validate_path("open", "").is_err());
+        assert!(validate_path("open", "code/porthole").is_err());
+        assert!(validate_path("open", "/tmp/evil\npath").is_err());
+        assert!(validate_path("open", "-rf").is_err());
+    }
 
     #[test]
     fn builds_zed_ssh_urls() {

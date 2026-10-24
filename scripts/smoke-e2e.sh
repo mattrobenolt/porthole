@@ -169,6 +169,23 @@ sleep 0.3
 }
 echo "   zed received the ssh URL with the daemon's host alias"
 
+echo "== 1d. open a mirrored path over the real RemoteForward =="
+ln -s "$PWD/target/debug/porthole" "$T/open"
+: > "$T/project/report.html"
+(cd "$T/project" && "$T/open" report.html)
+sleep 0.3
+[ "$(tail -n 1 "$T/opened.log")" = "$project/report.html" ] || {
+    echo "FAIL: opener got '$(tail -n 1 "$T/opened.log")' instead of '$project/report.html'"
+    cat "$T/daemon.log"; exit 1
+}
+echo "   mirrored path arrived as an absolute local path and reached the opener"
+
+rc=0; "$T/open" "$T/definitely-missing" >/dev/null 2>"$T/open-missing.err" || rc=$?
+[ "$rc" = 1 ] && grep -q "does not exist on this Mac" "$T/open-missing.err" || {
+    echo "FAIL: missing path exit=$rc"; cat "$T/open-missing.err"; cat "$T/daemon.log"; exit 1
+}
+echo "   a path with no local counterpart is refused, not spooled or opened"
+
 echo "== 2. loopback URL, one box shares loopback: expect 'local wins' =="
 echo "   (a REAL tunnel carrying traffic needs two machines — this box's =="
 echo "    remote and local share 127.0.0.1, so the probe is right to fire) =="

@@ -33,7 +33,7 @@ commands:
   clipboard  set the local clipboard from stdin (also: pbcopy)
   daemon     run the local daemon (owned by launchd)
   herdr-open open a URL from a herdr link handler (reads HERDR_PLUGIN_CLICKED_URL)
-  open       send a URL to the daemon, spool it if unreachable
+  open       send a URL or a mirrored path to the daemon
   paste      print the local clipboard to stdout (also: pbpaste)
   status     show daemon and tunnel state
   tunnel     inspect or kill tunnels
@@ -47,7 +47,7 @@ const HELP: &str = "\
 porthole — open URLs from remote machines in the local browser
 
 usage:
-  porthole open <url>         send a URL to the local browser
+  porthole open <url|path>    send a URL, or a mirrored path, to the Mac
   porthole herdr-open <url>   open a URL from a herdr link handler
   porthole clipboard          set the local clipboard from stdin
   porthole paste              print the local clipboard to stdout
@@ -132,6 +132,13 @@ enum Request<'a> {
         #[serde(borrow)]
         zed: ZedTarget<'a>,
     },
+    /// A path that is expected to exist at the same location on the
+    /// Mac. Unlike Open, this one gets a reply: a path with no local
+    /// counterpart must fail on the remote, not in a Finder error.
+    Path {
+        #[serde(borrow)]
+        path: Cow<'a, str>,
+    },
 }
 
 /// The remote half of a `zed` request: a path on this machine and the
@@ -146,11 +153,11 @@ pub(crate) struct ZedTarget<'a> {
 }
 
 /// The daemon's reply, one JSON line on the same connection, for the
-/// requests that need one: Paste and Zed. The write requests (Open,
-/// Clipboard) stay fire-and-forget with no ack.
-/// Paste success carries the clipboard, Zed success carries `ok`, and
-/// failure carries a reason, so the client fails fast on the daemon's
-/// own terms instead of timing out.
+/// requests that need one: Paste, Zed, and Path. The write requests
+/// (Open, Clipboard) stay fire-and-forget with no ack. Paste success
+/// carries the clipboard, Zed and Path success carry `ok`, and failure
+/// carries a reason, so the client fails fast on the daemon's own terms
+/// instead of timing out.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum Response<'a> {
@@ -167,24 +174,63 @@ enum Response<'a> {
     },
 }
 
-fn open(args: impl Iterator<Item = String>) -> ExitCode {
-    let mut args = args;
-    // Exactly one positional argument.
-    let (Some(url), None) = (args.next(), args.next()) else {
-        eprintln!("usage: porthole open <url>");
+/// `porthole open` (also reachable as `open`): the remote's one entry
+/// point. A URL goes to the Mac's browser. Anything else is a path that
+/// is expected to exist at the same absolute location on the Mac, where
+/// the daemon opens it in the default application. Keeping the trees in
+/// sync is the user's job; nothing is transferred.
+fn open(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut target = None;
+    let mut after_separator = false;
+    for arg in args.by_ref() {
+        if !after_separator {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    eprintln!("usage: porthole open <url|path>");
+                    return ExitCode::SUCCESS;
+                }
+                "--" => {
+                    after_separator = true;
+                    continue;
+                }
+                _ if arg.starts_with('-') => {
+                    eprintln!(
+                        "porthole open: unsupported flag '{arg}' (this shim opens one URL or path)"
+                    );
+                    return ExitCode::from(2);
+                }
+                _ => {}
+            }
+        }
+        if target.is_some() {
+            eprintln!("porthole open: one URL or path at a time");
+            return ExitCode::from(2);
+        }
+        target = Some(arg);
+    }
+    let Some(target) = target else {
+        eprintln!("usage: porthole open <url|path>");
         return ExitCode::from(2);
     };
 
     // Cheap client-side gate so typos fail loudly instead of spooling.
     // The daemon remains the real validator; it trusts nothing.
-    let scheme_ok = Url::parse(&url)
-        .map(|u| matches!(u.scheme(), "http" | "https"))
-        .unwrap_or(false);
-    if !scheme_ok {
-        eprintln!("porthole open: only http and https URLs are accepted");
-        return ExitCode::from(2);
+    match Url::parse(&target) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => open_url(&target),
+        Ok(url) => {
+            eprintln!("porthole open: unsupported URL scheme '{}'", url.scheme());
+            eprintln!(
+                "porthole open: pass an http/https URL, or a path (prefix a path containing ':' with ./)"
+            );
+            ExitCode::from(2)
+        }
+        // No scheme at all: Url::parse only fails for relative paths.
+        Err(_) => open_path(&target),
     }
+}
 
+/// The URL half: fire-and-forget, spooled when the daemon is unreachable.
+fn open_url(url: &str) -> ExitCode {
     let Some(home) = env::home_dir() else {
         eprintln!("porthole open: cannot determine home directory");
         return ExitCode::FAILURE;
@@ -192,7 +238,49 @@ fn open(args: impl Iterator<Item = String>) -> ExitCode {
     let sock = home.join(".porthole.sock");
     let spool = home.join(".porthole.spool");
 
-    match open_inner(&sock, &spool, &url) {
+    match open_inner(&sock, &spool, url) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("porthole open: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The path half: resolve the way a shell would, then wait for the
+/// daemon's reply. Never spooled — a stale path open would steal focus
+/// at a random later moment, and the daemon's answer ("not on this Mac")
+/// is the whole point of the round trip.
+fn open_path(raw: &str) -> ExitCode {
+    let Some(home) = env::home_dir() else {
+        eprintln!("porthole open: cannot determine home directory");
+        return ExitCode::FAILURE;
+    };
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("porthole open: cannot determine current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = match absolute_path(raw, &home, &cwd) {
+        Ok(path) => path,
+        Err(reason) => {
+            eprintln!("porthole open: {reason}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let sock = home.join(".porthole.sock");
+    let spool = home.join(".porthole.spool");
+    match reply_inner(
+        &sock,
+        &spool,
+        "open",
+        &Request::Path {
+            path: Cow::Borrowed(path.as_str()),
+        },
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("porthole open: {e}");
@@ -262,23 +350,12 @@ fn zed(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
 
     let raw = path.unwrap_or_else(|| ".".to_string());
-    let target = if raw == "~" {
-        home.clone()
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        home.join(rest)
-    } else {
-        cwd.join(raw)
-    };
-    let resolved = match absolute(&target) {
+    let path = match absolute_path(&raw, &home, &cwd) {
         Ok(path) => path,
-        Err(e) => {
-            eprintln!("zed: cannot resolve {}: {e}", target.display());
+        Err(reason) => {
+            eprintln!("zed: {reason}");
             return ExitCode::FAILURE;
         }
-    };
-    let Some(path) = resolved.to_str() else {
-        eprintln!("zed: path is not valid UTF-8");
-        return ExitCode::FAILURE;
     };
 
     let user = env::var("USER")
@@ -291,7 +368,19 @@ fn zed(mut args: impl Iterator<Item = String>) -> ExitCode {
 
     let sock = home.join(".porthole.sock");
     let spool = home.join(".porthole.spool");
-    match zed_inner(&sock, &spool, path, &user) {
+    // No spool: a stale `zed .` from hours ago would steal focus at a
+    // random later moment, which is worse than a clear failure now.
+    match reply_inner(
+        &sock,
+        &spool,
+        "zed",
+        &Request::Zed {
+            zed: ZedTarget {
+                path: Cow::Borrowed(path.as_str()),
+                user: Cow::Borrowed(&user),
+            },
+        },
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("zed: {e}");
@@ -300,31 +389,50 @@ fn zed(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
-/// Send the request and wait for the daemon's one-line ack. No spool:
-/// a stale `zed .` from hours ago would steal focus at a random later
-/// moment, which is worse than a clear failure now.
-fn zed_inner(sock: &Path, spool: &Path, path: &str, user: &str) -> io::Result<()> {
+/// Resolve one positional path the way a shell would: `~` and `~/...`
+/// expand to the home directory, everything else joins the cwd. No
+/// existence check and no symlink resolution — the far side decides
+/// whether the path is real. Shared so `zed` and `open <path>` agree on
+/// what a relative path means.
+fn absolute_path(raw: &str, home: &Path, cwd: &Path) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("empty path".to_string());
+    }
+    let target = if raw == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        cwd.join(raw)
+    };
+    let resolved =
+        absolute(&target).map_err(|e| format!("cannot resolve {}: {e}", target.display()))?;
+    resolved
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "path is not valid UTF-8".to_string())
+}
+
+/// Connect, flush the URL spool (the transport is up), send one request
+/// that gets a reply, and map the reply. `zed` and `open <path>` share
+/// this: both hand off to a local app, and both fail fast instead of
+/// spooling. The verb only shapes the error message.
+fn reply_inner(sock: &Path, spool: &Path, verb: &str, request: &Request<'_>) -> io::Result<()> {
     let mut stream = UnixStream::connect(sock).map_err(|e| {
         if unreachable(&e) {
-            io::Error::other("daemon unreachable (zed needs a live connection)")
+            io::Error::other(format!(
+                "daemon unreachable ({verb} needs a live connection)"
+            ))
         } else {
             e
         }
     })?;
-    stream.set_write_timeout(Some(ZED_TIMEOUT))?;
+    stream.set_write_timeout(Some(REPLY_TIMEOUT))?;
 
     flush_spool(&mut stream, spool)?;
-    write_request(
-        &mut stream,
-        &Request::Zed {
-            zed: ZedTarget {
-                path: Cow::Borrowed(path),
-                user: Cow::Borrowed(user),
-            },
-        },
-    )?;
+    write_request(&mut stream, request)?;
 
-    let line = read_reply(&mut stream, ZED_TIMEOUT)?;
+    let line = read_reply(&mut stream, REPLY_TIMEOUT)?;
     match serde_json::from_str::<Response>(line.trim_end()) {
         Ok(Response::Ok { ok: true }) => Ok(()),
         Ok(Response::Error { error }) => Err(io::Error::other(error.into_owned())),
@@ -335,10 +443,10 @@ fn zed_inner(sock: &Path, spool: &Path, path: &str, user: &str) -> io::Result<()
     }
 }
 
-/// How long the `zed` shim waits for the daemon to hand the URL to the
-/// local Zed CLI. The CLI returns as soon as it hands off; the margin is
-/// for a cold app launch.
-const ZED_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the client waits for the daemon to hand a request to a local
+/// app. The app returns as soon as it takes the handoff; the margin is
+/// for a cold launch.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Deliberately blocking std I/O: one connect and a few writes, no
 /// concurrency, in a short-lived process. Tokio earns its keep in the
@@ -670,6 +778,18 @@ mod tests {
         };
         assert_eq!(zed.path, "/Users/matt/code/porthole");
         assert_eq!(zed.user, "matt");
+
+        let path: Request =
+            serde_json::from_str(r#"{"path":"/Users/matt/code/porthole"}"#).unwrap();
+        let Request::Path { path } = path else {
+            panic!("expected Path");
+        };
+        assert_eq!(path, "/Users/matt/code/porthole");
+        let wire = serde_json::to_string(&Request::Path {
+            path: Cow::Borrowed("/Users/matt/code/porthole"),
+        })
+        .unwrap();
+        assert_eq!(wire, r#"{"path":"/Users/matt/code/porthole"}"#);
     }
 
     #[test]

@@ -82,7 +82,12 @@ On the remote, nothing changes. Every entry point routes to the client:
 - `xdg-open <url>`, which honors `$BROWSER`
 - tools that read `$BROWSER` directly
 - `gio open <url>` through the registered MIME handler
-- a plain `open <url>` shim for macOS-style callers
+- a plain `open` shim for macOS-style callers. `open <url>` reaches the
+  browser. `open <path>` opens the same path in its default Mac
+  application when that path exists on the Mac. Nothing is transferred:
+  porthole relies on your trees matching, which they do for synced homes.
+  A path with no local counterpart fails with a clear error and is never
+  spooled. The daemon checks before it opens anything.
 - `porthole open <url>` directly
 - `zed .` (or `zed <path>`) opens that path on the remote in the local
   Zed over SSH. The remote module installs a `zed` shim by default;

@@ -67,11 +67,14 @@ echo "== 1. direct URL via the real client =="
 echo "== 1b. zed shim: remote cwd becomes an ssh URL for the local Zed =="
 ln -s "$PWD/target/debug/porthole" "$T/zed"
 mkdir -p "$T/project"
+# pwd -P: the client joins the kernel cwd, which resolves symlinks
+# (macOS /var -> /private/var), while $T keeps the mktemp spelling.
+project=$(cd "$T/project" && pwd -P)
 (cd "$T/project" && "$T/zed" .)
 (cd "$T/project" && "$T/zed" "two words")
 sleep 0.2
-expected="ssh://$USER@testhost$T/project"
-expected_spaced="ssh://$USER@testhost$T/project/two%20words"
+expected="ssh://$USER@testhost$project"
+expected_spaced="ssh://$USER@testhost$project/two%20words"
 if [ "$(sed -n 1p "$T/zed.log")" = "$expected" ] &&
    [ "$(sed -n 2p "$T/zed.log")" = "$expected_spaced" ]; then
     echo "   zed received both URLs"
@@ -84,6 +87,36 @@ rc=0; "$T/zed" a b >/dev/null 2>&1 || rc=$?
 
 rc=0; "$T/zed" --foreground >/dev/null 2>&1 || rc=$?
 [ "$rc" = 2 ] && echo "   unsupported flags rejected (exit=2)" || { echo "FAIL: unsupported flag exit=$rc"; exit 1; }
+
+echo "== 1c. open shim: a mirrored path opens locally, a missing one replies =="
+ln -s "$PWD/target/debug/porthole" "$T/open"
+mkdir -p "$T/project/mirror dir"
+: > "$T/project/mirror dir/file.txt"
+before=$(wc -l < "$T/opened.log")
+(cd "$T/project" && "$T/open" "mirror dir/file.txt")
+sleep 0.2
+after=$(wc -l < "$T/opened.log")
+[ "$after" = "$((before + 1))" ] || { echo "FAIL: path open did not reach the opener"; exit 1; }
+last=$(tail -n 1 "$T/opened.log")
+case "$last" in
+    */project/mirror\ dir/file.txt) ;;
+    *) echo "FAIL: opener got '$last'"; exit 1 ;;
+esac
+[ -e "$last" ] || { echo "FAIL: opener got a path that does not exist: $last"; exit 1; }
+echo "   relative path resolved to '$last' and opened"
+
+rc=0; "$T/open" "$T/no-such-file" >/dev/null 2>"$T/open-missing.err" || rc=$?
+[ "$rc" = 1 ] && grep -q "does not exist on this Mac" "$T/open-missing.err" || {
+    echo "FAIL: missing path exit=$rc"; cat "$T/open-missing.err"; exit 1
+}
+[ "$(wc -l < "$T/opened.log")" = "$after" ] || { echo "FAIL: missing path still hit the opener"; exit 1; }
+echo "   missing local path fails with the daemon's reason"
+
+rc=0; "$T/open" ftp://nope >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && echo "   unsupported URL scheme rejected (exit=2)" || { echo "FAIL: ftp exit=$rc"; exit 1; }
+
+rc=0; "$T/open" -R >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && echo "   unsupported flag rejected (exit=2)" || { echo "FAIL: flag exit=$rc"; exit 1; }
 
 echo "== 2. loopback URL (tunnel deferred to milestone 3) =="
 ./target/debug/porthole open http://localhost:3000
@@ -213,5 +246,10 @@ rc=0; (cd "$T/project" && "$T/zed" .) >/dev/null 2>"$T/zed-down.err" || rc=$?
 [ "$rc" = 1 ] && grep -q "daemon unreachable" "$T/zed-down.err" && \
     echo "   zed fails fast with the daemon down" || { echo "FAIL: zed down exit=$rc"; cat "$T/zed-down.err"; exit 1; }
 [ ! -e "$T/.porthole.spool" ] && echo "   zed was not spooled" || { echo "FAIL: zed request was spooled"; exit 1; }
+
+rc=0; "$T/open" "$T/project" >/dev/null 2>"$T/open-down.err" || rc=$?
+[ "$rc" = 1 ] && grep -q "daemon unreachable" "$T/open-down.err" && \
+    echo "   path open fails fast with the daemon down" || { echo "FAIL: path open down exit=$rc"; cat "$T/open-down.err"; exit 1; }
+[ ! -e "$T/.porthole.spool" ] && echo "   path open was not spooled" || { echo "FAIL: path open was spooled"; exit 1; }
 
 echo "== smoke test passed =="
